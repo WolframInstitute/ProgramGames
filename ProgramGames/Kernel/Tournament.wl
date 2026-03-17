@@ -1,19 +1,18 @@
 (* ::Package:: *)
 
+Package["WolframInstitute`ProgramGames`"]
+
+
 (* ::Section::Closed:: *)
-(*PackageExported*)
+(*Exported Symbols*)
 
 
-PackageExported[
-	{
-		TuringMachineTournament,
-		CellularAutomatonTournament,
-		FiniteStateMachineTournament,
-		ProgramTournament,
-		PayoffToString,
-		StrategyToJSON
-	}
-];
+PackageExport["TuringMachineTournament"]
+PackageExport["CellularAutomatonTournament"]
+PackageExport["FiniteStateMachineTournament"]
+PackageExport["ProgramTournament"]
+PackageExport["PayoffToString"]
+PackageExport["StrategyToJSON"]
 
 
 (* ::Section::Closed:: *)
@@ -83,22 +82,18 @@ iParsePairwise[pairwise_List, keyA_String, keyB_String] :=
 Options[TuringMachineTournament] = {
 	"MaxSteps" -> 500,
 	"Rounds" -> 100,
-	"Game" -> "pd"
+	"Game" -> "pd",
+	"GPU" -> True
 };
 
 TuringMachineTournament[tmIds_List, s_Integer, k_Integer, opts : OptionsPattern[]] :=
-	Module[{gameStr, stdout, result},
+	Module[{gameStr, resultJSON, result},
 		gameStr = PayoffToString[OptionValue["Game"]];
-		stdout = iRunBinary[
-			{"tournament",
-				"--states", ToString[s], "--symbols", ToString[k],
-				"--max-steps", ToString[OptionValue["MaxSteps"]],
-				"--rounds", ToString[OptionValue["Rounds"]],
-				"--game", gameStr, "--gpu", "--ids-file", "-"},
-			StringRiffle[ToString /@ tmIds, "\n"]
-		];
-		If[stdout === $Failed, Return[$Failed]];
-		result = ImportString[stdout, "RawJSON"];
+		resultJSON = TMTournamentWL[s, k,
+			OptionValue["MaxSteps"], OptionValue["Rounds"],
+			gameStr, ExportString[tmIds, "RawJSON"], TrueQ[OptionValue["GPU"]]];
+		If[FailureQ[resultJSON], Return[$Failed]];
+		result = ImportString[resultJSON, "RawJSON"];
 		<|
 			"IDs" -> result["ids"],
 			"Scores" -> result["scores"],
@@ -122,18 +117,13 @@ Options[ProgramTournament] = {
 };
 
 ProgramTournament[strategies_List, opts : OptionsPattern[]] :=
-	Module[{ndjson, gameStr, stdout, result},
+	Module[{ndjson, gameStr, resultJSON, result},
 		ndjson = StringRiffle[StrategyToJSON /@ strategies, "\n"];
 		gameStr = PayoffToString[OptionValue["Game"]];
-		stdout = iRunBinary[
-			{"tournament",
-				"--rounds", ToString[OptionValue["Rounds"]],
-				"--game", gameStr,
-				"--strategies-file", "-"},
-			ndjson
-		];
-		If[stdout === $Failed, Return[$Failed]];
-		result = ImportString[stdout, "RawJSON"];
+		resultJSON = ProgramTournamentWL[
+			OptionValue["Rounds"], gameStr, ndjson];
+		If[FailureQ[resultJSON], Return[$Failed]];
+		result = ImportString[resultJSON, "RawJSON"];
 		<|
 			"Strategies" -> result["strategies"],
 			"Labels" -> Lookup[result["ranking"], "label"],

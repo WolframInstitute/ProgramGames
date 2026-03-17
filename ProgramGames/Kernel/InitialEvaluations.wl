@@ -1,39 +1,38 @@
 (* ::Package:: *)
 
-(* ::Section::Closed:: *)
-(*PackageExported*)
+Package["WolframInstitute`ProgramGames`"]
 
-
-PackageExported[
-	{
-		ProgramGamesBinary,
-		ProgramGamesBuild,
-		TuringMachineMaxIndex
-	}
-];
+PackageImport["GeneralUtilities`"]
 
 
 (* ::Section::Closed:: *)
-(*PackageScoped*)
+(*Exported Symbols*)
 
 
-PackageScoped[
-	{
-		$ProgramGamesPackageDirectory,
-		$ProgramGamesLibDirectory,
-		$TMSearchBin,
-		iRunBinary
-	}
-];
+PackageExport["TuringMachineMaxIndex"]
+PackageExport["ProgramGamesSetup"]
+
+
+(* ::Section::Closed:: *)
+(*Scoped Symbols*)
+
+
+PackageScope["$ProgramGamesPackageDirectory"]
+PackageScope["functions"]
+PackageScope["TMSearchWL"]
+PackageScope["TMClassifyWL"]
+PackageScope["TMTournamentWL"]
+PackageScope["ProgramTournamentWL"]
+PackageScope["TMMaxIndexWL"]
 
 
 (* ::Section::Closed:: *)
 (*Usage Messages*)
 
 
-ProgramGamesBinary::usage = "ProgramGamesBinary[] returns the path to the tm-search binary, or $Failed if not found.";
-ProgramGamesBuild::usage = "ProgramGamesBuild[] builds the tm-search binary from source using cargo.";
 TuringMachineMaxIndex::usage = "TuringMachineMaxIndex[s, k] returns the maximum TM index for (s,k) space: (2sk)^(sk) - 1.";
+
+ProgramGamesSetup::usage = "ProgramGamesSetup[] installs required dependencies and builds the Rust library.";
 
 
 (* ::Section::Closed:: *)
@@ -41,7 +40,6 @@ TuringMachineMaxIndex::usage = "TuringMachineMaxIndex[s, k] returns the maximum 
 
 
 $ProgramGamesPackageDirectory = DirectoryName[$InputFileName];
-$ProgramGamesLibDirectory = FileNameJoin[{DirectoryName[$ProgramGamesPackageDirectory], "Lib"}];
 
 
 (* ::Section::Closed:: *)
@@ -52,54 +50,86 @@ TuringMachineMaxIndex[s_Integer, k_Integer] := (2 s k)^(s k) - 1
 
 
 (* ::Section::Closed:: *)
-(*Binary Discovery*)
+(*Setup*)
 
 
-ProgramGamesBinary[] := Module[{candidate},
-	candidate = FileNameJoin[{$ProgramGamesLibDirectory, "tm-search", "target", "release", "tm-search"}];
-	If[FileExistsQ[candidate], Return[candidate]];
-	With[{which = Quiet @ RunProcess[{"which", "tm-search"}]},
-		If[AssociationQ[which] && which["ExitCode"] === 0,
-			Return[StringTrim[which["StandardOutput"]]]
+ProgramGamesSetup[] := (
+	PacletInstall[
+		"https://www.wolframcloud.com/obj/nikm/ExternalEvaluate.paclet",
+		ForceVersionInstall -> True
+	];
+	PacletInstall[
+		"https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet",
+		ForceVersionInstall -> True
+	];
+	Needs["ExtensionCargo`"];
+	SetEnvironment[
+		"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
+	];
+	ExtensionCargo`CargoBuild[PacletObject["WolframInstitute/ProgramGames"]]
+)
+
+
+(* ::Section::Closed:: *)
+(*Cargo Library Loading*)
+
+
+functions := functions = (
+	If[!PacletObjectQ[PacletObject["PacletExtensions"]],
+		PacletInstall["https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet"]
+	];
+	Needs["ExtensionCargo`"];
+	SetEnvironment[
+		"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
+	];
+	Replace[
+		ExtensionCargo`CargoLoad[
+			PacletObject["WolframInstitute/ProgramGames"],
+			"Functions"
+		],
+		Except[_ ? AssociationQ] :> Replace[
+			ExtensionCargo`CargoBuild[PacletObject["WolframInstitute/ProgramGames"]], {
+				f : Except[{__ ? FileExistsQ}] :> (
+					Function @ Function @ Failure["CargoBuildError", <|
+						"MessageTemplate" -> "Cargo build failed",
+						"Return" -> f
+					|>]
+				),
+				files_ :> Replace[
+					ExtensionCargo`CargoLoad[files, "Functions"],
+					f : Except[_ ? AssociationQ] :>
+						Function @ Function @ Failure["CargoLoadError", <|
+							"MessageTemplate" -> "Cargo load failed",
+							"Return" -> f
+						|>]
+				]
+			}
 		]
-	];
-	$Failed
-]
-
-
-ProgramGamesBuild[] := Module[{srcDir, proc},
-	srcDir = FileNameJoin[{$ProgramGamesLibDirectory, "tm-search"}];
-	If[!DirectoryQ[srcDir], Return[$Failed]];
-	proc = RunProcess[{"cargo", "build", "--release"}, ProcessDirectory -> srcDir];
-	If[proc["ExitCode"] === 0,
-		$TMSearchBin = ProgramGamesBinary[],
-		$Failed
 	]
-]
+) // Replace[{
+	funcs_ ? AssociationQ :>
+		Association @ KeyValueMap[
+			#1 -> Composition[
+				Replace[LibraryFunctionError[error_, code_] :>
+					Failure["RustError", <|
+						"MessageTemplate" -> "Rust error: `` (``)",
+						"MessageParameters" -> {error, code},
+						"Error" -> error, "ErrorCode" -> code, "Function" -> #1
+					|>]
+				],
+				#2
+			] &,
+			funcs
+		]
+}]
 
 
 (* ::Section::Closed:: *)
-(*Cached Binary Path*)
+(*Function Bindings*)
 
 
-$TMSearchBin := $TMSearchBin = ProgramGamesBinary[]
-
-
-(* ::Section::Closed:: *)
-(*Internal Binary Runner*)
-
-
-iRunBinary[args_List] := iRunBinary[args, ""]
-
-iRunBinary[args_List, stdin_String] := Module[{proc, stdout},
-	If[$TMSearchBin === $Failed, Return[$Failed]];
-	proc = If[stdin === "",
-		RunProcess[Prepend[args, $TMSearchBin]],
-		RunProcess[Prepend[args, $TMSearchBin], "StandardOutput", stdin]
-	];
-	stdout = If[StringQ[proc], proc, proc["StandardOutput"]];
-	If[(!StringQ[proc]) && AssociationQ[proc] && proc["ExitCode"] =!= 0,
-		Return[$Failed]
-	];
-	stdout
-]
+TMSearchWL := functions["tm_search_wl"]
+TMClassifyWL := functions["tm_classify_wl"]
+TMTournamentWL := functions["tm_tournament_wl"]
+ProgramTournamentWL := functions["program_tournament_wl"]
+TMMaxIndexWL := functions["tm_max_index_wl"]

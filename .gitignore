@@ -7,6 +7,10 @@ target/
 # Mathematica
 *.nb.bak
 *.mx
+*.paclet
+build/
 
 # Vim stuff
 *.sw?
+
+MacOSX-ARM64/

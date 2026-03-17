@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "tm-search",
+]
+resolver = "2"
+
+[patch.crates-io]
+wolfram-app-discovery = { git = "https://github.com/WolframResearch/wolfram-app-discovery-rs" }
+
+[profile.release]
+lto = "thin"
+opt-level = 3

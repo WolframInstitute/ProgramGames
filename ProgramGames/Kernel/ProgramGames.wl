@@ -1,13 +1,3 @@
 (* ::Package:: *)
 
-(* ::Section::Closed:: *)
-(*PackageInitialize*)
-
-
-PackageInitialize["WolframInstitute`ProgramGames`",
-	<|
-		"LoadFirstFiles" -> {"InitialEvaluations.wl"},
-		"LoadLastFiles" -> {},
-		"IgnoreFiles" -> {}
-	|>
-]
+Get[FileNameJoin[{DirectoryName[$InputFileName], "InitialEvaluations.wl"}]];

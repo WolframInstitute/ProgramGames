@@ -1,28 +1,11 @@
 (* ::Package:: *)
 
+Package["WolframInstitute`ProgramGames`"]
+
+
 (* ::Section::Closed:: *)
 (*Cellular automata — search, classification, and analysis*)
 (*Phase 2: CA-specific functions beyond tournament play*)
-
-
-(* ::Section::Closed:: *)
-(*PackageExported*)
-
-
-PackageExported[
-	{
-	}
-];
-
-
-(* ::Section::Closed:: *)
-(*PackageScoped*)
-
-
-PackageScoped[
-	{
-	}
-];
 
 
 (* ::Section::Closed:: *)

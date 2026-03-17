@@ -1,28 +1,11 @@
 (* ::Package:: *)
 
+Package["WolframInstitute`ProgramGames`"]
+
+
 (* ::Section::Closed:: *)
 (*Finite state machines — search, classification, and analysis*)
 (*Phase 2: FSM-specific functions beyond tournament play*)
-
-
-(* ::Section::Closed:: *)
-(*PackageExported*)
-
-
-PackageExported[
-	{
-	}
-];
-
-
-(* ::Section::Closed:: *)
-(*PackageScoped*)
-
-
-PackageScoped[
-	{
-	}
-];
 
 
 (* ::Section::Closed:: *)

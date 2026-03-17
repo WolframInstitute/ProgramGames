@@ -1,20 +1,19 @@
 (* ::Package:: *)
 
+Package["WolframInstitute`ProgramGames`"]
+
+
 (* ::Section::Closed:: *)
 (*Visualization — survey and classification tables*)
 
 
 (* ::Section::Closed:: *)
-(*PackageExported*)
+(*Exported Symbols*)
 
 
-PackageExported[
-	{
-		SpaceSurveyTable,
-		ClassificationTable,
-		ShortNum
-	}
-];
+PackageExport["SpaceSurveyTable"]
+PackageExport["ClassificationTable"]
+PackageExport["ShortNum"]
 
 
 (* ::Section::Closed:: *)
@@ -57,7 +56,8 @@ Options[SpaceSurveyTable] = {
 $DefaultSpaces = {{2, 2}, {3, 2}, {2, 3}, {4, 2}, {3, 3}, {5, 2}};
 
 
-SpaceSurveyTable[spaces_List : $DefaultSpaces, opts : OptionsPattern[]] :=
+SpaceSurveyTable[opts : OptionsPattern[]] := SpaceSurveyTable[$DefaultSpaces, opts]
+SpaceSurveyTable[spaces_List, opts : OptionsPattern[]] :=
 	Module[{results, maxsteps, depth, sample},
 		maxsteps = OptionValue["MaxSteps"];
 		depth = OptionValue["Depth"];
@@ -124,7 +124,8 @@ Options[ClassificationTable] = {
 };
 
 
-ClassificationTable[spaces_List : $DefaultSpaces, opts : OptionsPattern[]] :=
+ClassificationTable[opts : OptionsPattern[]] := ClassificationTable[$DefaultSpaces, opts]
+ClassificationTable[spaces_List, opts : OptionsPattern[]] :=
 	Module[{results, maxsteps, depth, sample},
 		maxsteps = OptionValue["MaxSteps"];
 		depth = OptionValue["Depth"];

@@ -1,15 +1,14 @@
 (* ::Package:: *)
 
+Package["WolframInstitute`ProgramGames`"]
+
+
 (* ::Section::Closed:: *)
-(*PackageExported*)
+(*Exported Symbols*)
 
 
-PackageExported[
-	{
-		TuringMachineProgramSearch,
-		TuringMachineClassify
-	}
-];
+PackageExport["TuringMachineProgramSearch"]
+PackageExport["TuringMachineClassify"]
 
 
 (* ::Section::Closed:: *)
@@ -30,31 +29,24 @@ behavior, returning unique representatives and groups.";
 Options[TuringMachineProgramSearch] = {
 	"MaxSteps" -> 500,
 	"Depth" -> 4,
-	"Sample" -> Automatic
+	"Sample" -> Automatic,
+	"GPU" -> True
 };
 
 TuringMachineProgramSearch[s_Integer, k_Integer, opts : OptionsPattern[]] :=
-	Module[{maxsteps, depth, sample, maxIdx, mode, args, stdout, lines},
+	Module[{maxsteps, depth, sample, maxIdx, sampleCount, resultJSON},
 		maxsteps = OptionValue["MaxSteps"];
 		depth = OptionValue["Depth"];
 		sample = OptionValue["Sample"];
 		maxIdx = TuringMachineMaxIndex[s, k];
-		mode = Replace[sample, {
-			Automatic :> If[maxIdx + 1 > 10000000, 100000, "all"],
+		sampleCount = Replace[sample, {
+			Automatic :> If[maxIdx + 1 > 10000000, 100000, 0],
 			n_Integer :> n,
-			"all" :> "all"
+			"all" :> 0
 		}];
-		args = {"search",
-			"--states", ToString[s], "--symbols", ToString[k],
-			"--max-steps", ToString[maxsteps], "--depth", ToString[depth],
-			"--format", "ids", "--gpu"};
-		If[IntegerQ[mode],
-			AppendTo[args, "--sample"]; AppendTo[args, ToString[mode]]
-		];
-		stdout = iRunBinary[args];
-		If[stdout === $Failed, Return[{}]];
-		lines = StringSplit[stdout, "\n"];
-		ToExpression /@ Select[lines, StringMatchQ[#, DigitCharacter ..] &]
+		resultJSON = TMSearchWL[s, k, maxsteps, depth, sampleCount, TrueQ[OptionValue["GPU"]]];
+		If[FailureQ[resultJSON], Return[{}]];
+		ImportString[resultJSON, "RawJSON"]
 	]
 
 
@@ -65,26 +57,23 @@ TuringMachineProgramSearch[s_Integer, k_Integer, opts : OptionsPattern[]] :=
 Options[TuringMachineClassify] = {
 	"MaxSteps" -> 500,
 	"Depth" -> 4,
-	"Sample" -> Automatic
+	"Sample" -> Automatic,
+	"GPU" -> True
 };
 
 TuringMachineClassify[s_Integer, k_Integer, opts : OptionsPattern[]] :=
-	Module[{maxsteps, depth, ids, stdout, result},
+	Module[{maxsteps, depth, ids, resultJSON, result},
 		maxsteps = OptionValue["MaxSteps"];
 		depth = OptionValue["Depth"];
 		ids = TuringMachineProgramSearch[s, k,
 			"MaxSteps" -> maxsteps, "Depth" -> depth,
-			"Sample" -> OptionValue["Sample"]];
+			"Sample" -> OptionValue["Sample"],
+			"GPU" -> OptionValue["GPU"]];
 		If[Length[ids] == 0, Return[$Failed]];
-		stdout = iRunBinary[
-			{"classify",
-				"--states", ToString[s], "--symbols", ToString[k],
-				"--max-steps", ToString[maxsteps], "--depth", ToString[depth],
-				"--gpu", "--ids-file", "-"},
-			StringRiffle[ToString /@ ids, "\n"]
-		];
-		If[stdout === $Failed, Return[$Failed]];
-		result = ImportString[stdout, "RawJSON"];
+		resultJSON = TMClassifyWL[s, k, maxsteps, depth,
+			ExportString[ids, "RawJSON"], TrueQ[OptionValue["GPU"]]];
+		If[FailureQ[resultJSON], Return[$Failed]];
+		result = ImportString[resultJSON, "RawJSON"];
 		<|
 			"Representatives" -> result["representatives"],
 			"Groups" -> result["groups"],

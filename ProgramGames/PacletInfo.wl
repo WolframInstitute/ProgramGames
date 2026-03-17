@@ -1,3 +1,5 @@
+(* ::Package:: *)
+
 PacletObject[
   <|
     "Name" -> "WolframInstitute/ProgramGames",
@@ -5,17 +7,25 @@ PacletObject[
     "Creator" -> "Wolfram Institute",
     "License" -> "MIT",
     "PublisherID" -> "WolframInstitute",
-    "Version" -> "0.1.0",
-    "WolframVersion" -> "14.0+",
+    "Version" -> "1.0.0",
+    "WolframVersion" -> "14.3+",
+    "Dependencies" -> {"PacletExtensions"},
     "PrimaryContext" -> "WolframInstitute`ProgramGames`",
     "Extensions" -> {
+      {
+        "Cargo",
+        "Root" -> "Lib"
+      },
+      {
+        "Build",
+        "Actions" -> {"CargoBuild"}
+      },
       {
         "Kernel",
         "Root" -> "Kernel",
         "Context" -> {"WolframInstitute`ProgramGames`"},
         "Symbols" -> {
-          "WolframInstitute`ProgramGames`ProgramGamesBinary",
-          "WolframInstitute`ProgramGames`ProgramGamesBuild",
+          "WolframInstitute`ProgramGames`ProgramGamesSetup",
           "WolframInstitute`ProgramGames`TuringMachineProgramSearch",
           "WolframInstitute`ProgramGames`TuringMachineClassify",
           "WolframInstitute`ProgramGames`TuringMachineMaxIndex",
@@ -29,6 +39,9 @@ PacletObject[
           "WolframInstitute`ProgramGames`PayoffToString",
           "WolframInstitute`ProgramGames`StrategyToJSON"
         }
+      },
+      {
+        "Binaries"
       }
     }
   |>
