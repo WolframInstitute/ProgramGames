@@ -3,11 +3,11 @@
 Package["WolframInstitute`ProgramGames`"]
 
 
-(* ::Section::Closed:: *)
-(*Visualization — survey and classification tables*)
+(* ::Section:: *)
+(*Visualization \[LongDash] survey and classification tables*)
 
 
-(* ::Section::Closed:: *)
+(* ::Section:: *)
 (*Exported Symbols*)
 
 
@@ -16,7 +16,7 @@ PackageExport["ClassificationTable"]
 PackageExport["ShortNum"]
 
 
-(* ::Section::Closed:: *)
+(* ::Section:: *)
 (*Usage Messages*)
 
 
@@ -26,10 +26,11 @@ SpaceSurveyTable::usage = "SpaceSurveyTable[] generates a table of TM space size
 halting counts, and halting rates. Accepts a list of {s,k} pairs.";
 
 ClassificationTable::usage = "ClassificationTable[] generates a table showing \
-behavioral classification results: unique behaviors, reduction factors, and tournament pair counts.";
+behavioral classification results: unique behaviors, reduction factors, and tournament pair counts. \
+Accepts {\"TM\", s, k}, {\"CA\", k, r}, or {s, k} (TM) space specs.";
 
 
-(* ::Section::Closed:: *)
+(* ::Section:: *)
 (*ShortNum*)
 
 
@@ -42,7 +43,7 @@ ShortNum[n_?NumericQ] := Which[
 ]
 
 
-(* ::Section::Closed:: *)
+(* ::Section:: *)
 (*SpaceSurveyTable*)
 
 
@@ -114,7 +115,7 @@ SpaceSurveyTable[spaces_List, opts : OptionsPattern[]] :=
 	]
 
 
-(* ::Section::Closed:: *)
+(* ::Section:: *)
 (*ClassificationTable*)
 
 
@@ -125,40 +126,83 @@ Options[ClassificationTable] = {
 };
 
 
-ClassificationTable[opts : OptionsPattern[]] := ClassificationTable[$DefaultSpaces, opts]
+$DefaultClassificationSpaces = {
+	{"TM", 2, 2}, {"TM", 3, 2}, {"TM", 2, 3},
+	{"CA", 2, 1/2}, {"CA", 2, 1}, {"CA", 2, 3/2}
+};
+
+
+(* Normalize bare {s, k} to {"TM", s, k} for backward compatibility *)
+iNormalizeSpace[{s_Integer, k_Integer}] := {"TM", s, k}
+iNormalizeSpace[sp_List] := sp
+
+(* Classify a single space spec and return a result Association *)
+iClassifySpace[{"TM", s_Integer, k_Integer}, maxsteps_, depth_, sample_] :=
+	Module[{maxIdx, c, timing},
+		maxIdx = TuringMachineMaxIndex[s, k];
+		timing = First @ AbsoluteTiming[
+			c = TuringMachineClassify[s, k,
+				"MaxSteps" -> maxsteps, "Depth" -> depth,
+				"Sample" -> If[maxIdx + 1 > 10000000, sample, "all"]];
+		];
+		If[c === $Failed,
+			<|"Space" -> StringForm["TM(``,``)", s, k],
+				"SpaceSize" -> maxIdx + 1,
+				"Classified" -> "?", "Unique" -> "?", "Reduction" -> "?",
+				"UniquePairs" -> "?", "FullPairs" -> "?",
+				"Time" -> timing, "Method" -> "failed"|>,
+			<|"Space" -> StringForm["TM(``,``)", s, k],
+				"SpaceSize" -> maxIdx + 1,
+				"Classified" -> c["TotalHalting"],
+				"Unique" -> c["UniqueCount"],
+				"Reduction" -> c["ReductionFactor"],
+				"UniquePairs" -> c["UniqueCount"] (c["UniqueCount"] - 1),
+				"FullPairs" -> c["TotalHalting"] (c["TotalHalting"] - 1),
+				"Time" -> timing,
+				"Method" -> If[maxIdx + 1 > 10000000, "sampled", "exhaustive"]|>
+		]
+	]
+
+iClassifySpace[{"CA", k_Integer, r_}, maxsteps_, depth_, sample_] :=
+	Module[{totalRules, c, timing},
+		totalRules = CellularAutomatonMaxIndex[k, r] + 1;
+		timing = First @ AbsoluteTiming[
+			c = CellularAutomatonClassify[k, r,
+				"Steps" -> maxsteps, "Depth" -> depth,
+				"Sample" -> If[totalRules > 10000000, sample, "all"]];
+		];
+		If[c === $Failed,
+			<|"Space" -> StringForm["CA(``,``)", k, r],
+				"SpaceSize" -> totalRules,
+				"Classified" -> "?", "Unique" -> "?", "Reduction" -> "?",
+				"UniquePairs" -> "?", "FullPairs" -> "?",
+				"Time" -> timing, "Method" -> "failed"|>,
+			<|"Space" -> StringForm["CA(``,``)", k, r],
+				"SpaceSize" -> totalRules,
+				"Classified" -> Lookup[c, "SampledRules", totalRules],
+				"Unique" -> c["UniqueCount"],
+				"Reduction" -> c["ReductionFactor"],
+				"UniquePairs" -> c["UniqueCount"] (c["UniqueCount"] - 1),
+				"FullPairs" -> With[{cl = Lookup[c, "SampledRules", totalRules]}, cl * (cl - 1)],
+				"Time" -> timing,
+				"Method" -> If[totalRules > 10000000, "sampled", "exhaustive"]|>
+		]
+	]
+
+
+ClassificationTable[opts : OptionsPattern[]] := ClassificationTable[$DefaultClassificationSpaces, opts]
 ClassificationTable[space : {_Integer, _Integer}, opts : OptionsPattern[]] := ClassificationTable[{space}, opts]
+ClassificationTable[space : {_String, __}, opts : OptionsPattern[]] := ClassificationTable[{space}, opts]
 ClassificationTable[spaces_List, opts : OptionsPattern[]] :=
-	Module[{results, maxsteps, depth, sample},
+	Module[{results, maxsteps, depth, sample, normalizedSpaces},
 		maxsteps = OptionValue["MaxSteps"];
 		depth = OptionValue["Depth"];
 		sample = OptionValue["Sample"];
+		normalizedSpaces = iNormalizeSpace /@ spaces;
 
 		results = Table[
-			Module[{s = sp[[1]], k = sp[[2]], c, timing, maxIdx},
-				maxIdx = TuringMachineMaxIndex[s, k];
-				timing = First @ AbsoluteTiming[
-					c = TuringMachineClassify[s, k,
-						"MaxSteps" -> maxsteps, "Depth" -> depth,
-						"Sample" -> If[maxIdx + 1 > 10000000, sample, "all"]];
-				];
-				If[c === $Failed,
-					<|"Space" -> StringForm["TM(``,``)", s, k],
-						"SpaceSize" -> maxIdx + 1,
-						"Halting" -> "?", "Unique" -> "?", "Reduction" -> "?",
-						"UniquePairs" -> "?", "FullPairs" -> "?",
-						"Time" -> timing, "Method" -> "failed"|>,
-					<|"Space" -> StringForm["TM(``,``)", s, k],
-						"SpaceSize" -> maxIdx + 1,
-						"Halting" -> c["TotalHalting"],
-						"Unique" -> c["UniqueCount"],
-						"Reduction" -> c["ReductionFactor"],
-						"UniquePairs" -> c["UniqueCount"] (c["UniqueCount"] - 1),
-						"FullPairs" -> c["TotalHalting"] (c["TotalHalting"] - 1),
-						"Time" -> timing,
-						"Method" -> If[maxIdx + 1 > 10000000, "sampled", "exhaustive"]|>
-				]
-			],
-			{sp, spaces}
+			iClassifySpace[sp, maxsteps, depth, sample],
+			{sp, normalizedSpaces}
 		];
 
 		Grid[
@@ -168,8 +212,8 @@ ClassificationTable[spaces_List, opts : OptionsPattern[]] :=
 						{r["Space"],
 						If[NumberQ[r["SpaceSize"]],
 							NumberForm[r["SpaceSize"], DigitBlock -> 3], "?"],
-						If[IntegerQ[r["Halting"]],
-							NumberForm[r["Halting"], DigitBlock -> 3], r["Halting"]],
+						If[IntegerQ[r["Classified"]],
+							NumberForm[r["Classified"], DigitBlock -> 3], r["Classified"]],
 						If[IntegerQ[r["Unique"]],
 							NumberForm[r["Unique"], DigitBlock -> 3], r["Unique"]],
 						If[NumberQ[r["Reduction"]],
@@ -184,7 +228,7 @@ ClassificationTable[spaces_List, opts : OptionsPattern[]] :=
 					{row, results}
 				],
 				Style[#, Bold] & /@ {
-					"Space", "Total TMs", "Halting", "Unique", "Reduction",
+					"Space", "Total", "Classified", "Unique", "Reduction",
 					"Tournament pairs", "Time", "Method"}
 			],
 			Frame -> All,

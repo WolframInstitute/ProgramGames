@@ -7,8 +7,12 @@ If[!PacletObjectQ[PacletObject["PacletExtensions"]],
 
 << ExtensionCargo`
 
-publisher = "WolframInstitute"
-name = "ProgramGames"
+scriptDir = DirectoryName[$InputFileName];
+publisher = "WolframInstitute";
+name = "ProgramGames";
+localPacletDir = FileNameJoin[{scriptDir, name}];
+
+SetDirectory[scriptDir];
 
 (* Ensure cargo is in PATH *)
 SetEnvironment[
@@ -17,26 +21,34 @@ SetEnvironment[
 
 (* Build Rust library *)
 Print["Building Rust library..."]
-RunProcess[
-    {"cargo", "build", "--release"},
-    ProcessDirectory -> FileNameJoin[{name, "Lib", "tm-search"}]
-] // (Print["cargo exit code: ", #["ExitCode"]]; #) &;
+PacletDirectoryLoad[localPacletDir];
+paclet = SelectFirst[
+    PacletFind[publisher <> "/" <> name],
+    ExpandFileName[#["Location"]] === ExpandFileName[localPacletDir] &
+];
 
-(* Load paclet and collect binaries *)
-PacletDirectoryLoad[name]
-paclet = PacletObject[publisher <> "/" <> name]
+If[MissingQ[paclet],
+    Print["Could not resolve local paclet at ", localPacletDir];
+    Exit[1]
+];
+
+buildResult = CargoBuild[paclet];
+If[!MatchQ[buildResult, {__ ? FileExistsQ}],
+    Print["CargoBuild failed: ", InputForm[buildResult]];
+    Exit[1]
+];
 
 Print["Collecting binaries..."]
 Quiet[DeleteDirectory[FileNameJoin[{name, "Binaries"}], DeleteContents -> True]];
-CargoCollect[ParentDirectory[paclet["Location"]], FileNameJoin[{name, "Binaries"}]]
+CargoCollect[scriptDir, FileNameJoin[{name, "Binaries"}]];
 
 (* Create paclet archive *)
 Print["Creating paclet archive..."]
-pacletFile = CreatePacletArchive[name]
-Echo[StringTemplate["Paclet `` has size ``"][pacletFile, FileSize[pacletFile]]]
+pacletFile = CreatePacletArchive[name];
+Echo[StringTemplate["Paclet `` has size ``"][pacletFile, FileSize[pacletFile]]];
 
-PacletDirectoryUnload[name]
+PacletDirectoryUnload[localPacletDir];
 
 (* Install locally *)
-PacletInstall[pacletFile, ForceVersionInstall -> True]
+PacletInstall[pacletFile, ForceVersionInstall -> True];
 Print["Done. Paclet installed."]

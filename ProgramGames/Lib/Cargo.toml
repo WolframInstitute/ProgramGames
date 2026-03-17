@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "tm-search",
+    "program-games",
 ]
 resolver = "2"
 

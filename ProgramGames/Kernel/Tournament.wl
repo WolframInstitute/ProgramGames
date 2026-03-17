@@ -23,13 +23,14 @@ TuringMachineTournament::usage = "TuringMachineTournament[ids, s, k] runs a GPU-
 round-robin tournament among TM ids. Options: \"MaxSteps\", \"Rounds\", \"Game\".";
 
 CellularAutomatonTournament::usage = "CellularAutomatonTournament[rules] runs a tournament \
-among cellular automaton rules. Options: \"K\", \"R\", \"T\", \"Rounds\", \"Game\".";
+among cellular automaton rules. Options: \"Colors\", \"Radius\", \"Steps\", \"Rounds\", \"Game\".";
 
 FiniteStateMachineTournament::usage = "FiniteStateMachineTournament[ids] runs a tournament \
-among FSM ids. Options: \"S\", \"K\", \"Rounds\", \"Game\".";
+among FSM ids. Options: \"States\", \"Colors\", \"Rounds\", \"Game\".";
 
 ProgramTournament::usage = "ProgramTournament[strategies] runs a mixed-type tournament. \
-Strategies: {\"TM\",id,s,k}, {\"FSM\",id,s,k}, {\"CA\",rule,k,r,t}. \
+Strategies: {\"TM\",id,s,k}, {\"TM\",id,s,k,maxSteps}, {\"FSM\",id,s,k}, {\"CA\",rule,k,r,t}. \
+For TMs, an optional 5th element specifies maxSteps (default 500). Larger TMs (e.g. 3-state) may need higher values like 5000. \
 Options: \"Rounds\", \"Game\".";
 
 PayoffToString::usage = "PayoffToString[game] converts a WL payoff array to a comma-separated string.";
@@ -66,12 +67,33 @@ StrategyToJSON[{id_Integer, s_Integer, k_Integer}] :=
 
 
 (* ::Section::Closed:: *)
+(*iParseLabel*)
+
+
+iParseLabel[label_String] := Which[
+	StringMatchQ[label, "tm(" ~~ __ ~~ ")#" ~~ __],
+		With[{parts = StringCases[label, "tm(" ~~ s__ ~~ "," ~~ k__ ~~ ")#" ~~ id__ :> {"TM", {ToExpression[id], ToExpression[s], ToExpression[k]}}]},
+			If[Length[parts] > 0, First[parts], label]
+		],
+	StringMatchQ[label, "fsm(" ~~ __ ~~ ")#" ~~ __],
+		With[{parts = StringCases[label, "fsm(" ~~ s__ ~~ "," ~~ k__ ~~ ")#" ~~ id__ :> {"FSM", {ToExpression[id], ToExpression[s], ToExpression[k]}}]},
+			If[Length[parts] > 0, First[parts], label]
+		],
+	StringMatchQ[label, "ca(" ~~ __ ~~ ")#" ~~ __],
+		With[{parts = StringCases[label, "ca(k=" ~~ k__ ~~ ",r=" ~~ r__ ~~ ",t=" ~~ t__ ~~ ")#" ~~ rule__ :> {"CA", {ToExpression[rule], ToExpression[k], ToExpression[r]}}]},
+			If[Length[parts] > 0, First[parts], label]
+		],
+	True, label
+]
+
+
+(* ::Section::Closed:: *)
 (*iParsePairwise*)
 
 
-iParsePairwise[pairwise_List, keyA_String, keyB_String] :=
+iParsePairwise[pairwise_List, keyA_String, keyB_String, parseLabel_: Identity] :=
 	Association[
-		{#[keyA], #[keyB]} -> {#["score_a"], #["score_b"]} & /@ pairwise
+		{parseLabel[#[keyA]], parseLabel[#[keyB]]} -> {#["score_a"], #["score_b"]} & /@ pairwise
 	]
 
 
@@ -125,11 +147,11 @@ ProgramTournament[strategies_List, opts : OptionsPattern[]] :=
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
 		<|
-			"Strategies" -> result["strategies"],
-			"Labels" -> Lookup[result["ranking"], "label"],
+			"Strategies" -> (iParseLabel /@ result["strategies"]),
+			"Labels" -> (iParseLabel /@ Lookup[result["ranking"], "label"]),
 			"Scores" -> result["scores"],
-			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b"],
-			"Ranking" -> result["ranking"],
+			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b", iParseLabel],
+			"Ranking" -> Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]],
 			"Rounds" -> result["rounds"],
 			"Game" -> result["game"],
 			"NumStrategies" -> result["num_strategies"],
@@ -143,13 +165,13 @@ ProgramTournament[strategies_List, opts : OptionsPattern[]] :=
 
 
 Options[CellularAutomatonTournament] = {
-	"K" -> 2, "R" -> 1, "T" -> 10,
+	"Colors" -> 2, "Radius" -> 1, "Steps" -> 10,
 	"Rounds" -> 100, "Game" -> "pd"
 };
 
 CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
 	ProgramTournament[
-		{"CA", #, OptionValue["K"], OptionValue["R"], OptionValue["T"]} & /@ caRules,
+		{"CA", #, OptionValue["Colors"], OptionValue["Radius"], OptionValue["Steps"]} & /@ caRules,
 		"Rounds" -> OptionValue["Rounds"],
 		"Game" -> OptionValue["Game"]
 	]
@@ -160,13 +182,13 @@ CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
 
 
 Options[FiniteStateMachineTournament] = {
-	"S" -> 2, "K" -> 2,
+	"States" -> 2, "Colors" -> 2,
 	"Rounds" -> 100, "Game" -> "pd"
 };
 
 FiniteStateMachineTournament[fsmIds_List, opts : OptionsPattern[]] :=
 	ProgramTournament[
-		{"FSM", #, OptionValue["S"], OptionValue["K"]} & /@ fsmIds,
+		{"FSM", #, OptionValue["States"], OptionValue["Colors"]} & /@ fsmIds,
 		"Rounds" -> OptionValue["Rounds"],
 		"Game" -> OptionValue["Game"]
 	]

@@ -1,5 +1,5 @@
 [package]
-name = "tm-search"
+name = "program-games"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,12 +8,12 @@ default = ["metal"]
 metal = ["dep:metal"]
 
 [lib]
-name = "tm_search"
+name = "program_games"
 crate-type = ["lib", "cdylib"]
 path = "src/lib.rs"
 
 [[bin]]
-name = "tm-search"
+name = "program-games"
 path = "src/main.rs"
 
 [dependencies]

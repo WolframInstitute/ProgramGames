@@ -30,6 +30,8 @@ PacletObject[
           "WolframInstitute`ProgramGames`TuringMachineClassify",
           "WolframInstitute`ProgramGames`TuringMachineMaxIndex",
           "WolframInstitute`ProgramGames`TuringMachineTournament",
+          "WolframInstitute`ProgramGames`CellularAutomatonClassify",
+          "WolframInstitute`ProgramGames`CellularAutomatonMaxIndex",
           "WolframInstitute`ProgramGames`CellularAutomatonTournament",
           "WolframInstitute`ProgramGames`FiniteStateMachineTournament",
           "WolframInstitute`ProgramGames`ProgramTournament",

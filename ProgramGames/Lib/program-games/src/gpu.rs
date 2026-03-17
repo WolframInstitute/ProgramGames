@@ -617,6 +617,217 @@ kernel void tm_tournament(
             )
         }
     }
+
+    // ── CA Classification on Metal ──────────────────────────────────────
+
+    const CA_CLASSIFY_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CaClassifyParams {
+    uint total_rules;
+    uint k;
+    uint two_r;
+    uint t;
+    uint depth;
+    uint sig_len;
+    uint table_len;
+};
+
+#define CA_MAX_ROW   64
+#define CA_MAX_TABLE 256
+
+kernel void ca_classify(
+    device uchar* signatures         [[buffer(0)]],
+    constant CaClassifyParams& params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.total_rules) return;
+
+    uint rule_code = gid;
+    uint k = params.k;
+    uint two_r = params.two_r;
+    uint t_steps = params.t;
+    uint depth = params.depth;
+    uint neighborhood = two_r + 1;
+    uint table_len = params.table_len;
+
+    // Decode rule table: IntegerDigits[rule_code, k, table_len]
+    uchar rule_table[CA_MAX_TABLE];
+    {
+        uint tmp = rule_code;
+        for (int i = (int)table_len - 1; i >= 0; i--) {
+            rule_table[i] = tmp % k;
+            tmp /= k;
+        }
+    }
+
+    // Pointer to this rule's signature slice
+    ulong offset = (ulong)gid * (ulong)params.sig_len;
+    device uchar* my_sig = signatures + offset;
+    uint sig_idx = 0;
+
+    for (uint history_len = 0; history_len <= depth * 2; history_len++) {
+        uint num_histories;
+        if (history_len == 0) {
+            num_histories = 1;
+        } else {
+            num_histories = min(1u << min(history_len, 20u), 256u);
+        }
+
+        for (uint h = 0; h < num_histories; h++) {
+            // Empty history -> cooperate
+            if (history_len == 0) {
+                my_sig[sig_idx++] = 0;
+                continue;
+            }
+
+            // Build initial row from history bits (LSB-first, matching CPU)
+            uchar row[CA_MAX_ROW];
+            uint row_len = min(history_len, (uint)CA_MAX_ROW);
+
+            for (uint bit = 0; bit < row_len; bit++) {
+                row[bit] = (h >> bit) & 1;
+            }
+
+            // Run shrinking CA
+            for (uint step = 0; step < t_steps; step++) {
+                if (row_len <= two_r) break;
+                uint next_len = row_len - two_r;
+                if (next_len == 0) break;
+
+                uchar next_row[CA_MAX_ROW];
+                for (uint pos = 0; pos < next_len; pos++) {
+                    uint idx = 0;
+                    for (uint n = 0; n < neighborhood; n++) {
+                        idx = idx * k + row[pos + n];
+                    }
+                    next_row[pos] = (idx < table_len) ? rule_table[idx] : 0;
+                }
+
+                for (uint i = 0; i < next_len; i++) {
+                    row[i] = next_row[i];
+                }
+                row_len = next_len;
+            }
+
+            my_sig[sig_idx++] = row[row_len - 1] % 2;
+        }
+    }
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CaClassifyParams {
+        total_rules: u32,
+        k: u32,
+        two_r: u32,
+        t: u32,
+        depth: u32,
+        sig_len: u32,
+        table_len: u32,
+    }
+
+    pub struct MetalCaClassifier {
+        device: Device,
+        queue: CommandQueue,
+        pipeline: ComputePipelineState,
+    }
+
+    impl MetalCaClassifier {
+        pub fn new() -> Result<Self, String> {
+            let device =
+                Device::system_default().ok_or("Metal device unavailable")?;
+            eprintln!("  Metal CA classify on: {}", device.name());
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(CA_CLASSIFY_SHADER, &options)
+                .map_err(|e| format!("Metal CA shader compile: {e}"))?;
+            let func = library
+                .get_function("ca_classify", None)
+                .map_err(|e| format!("Metal CA function: {e}"))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("Metal CA pipeline: {e}"))?;
+            let queue = device.new_command_queue();
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+            })
+        }
+
+        /// Classify all CA rules on GPU. Returns flat signature buffer and sig_len.
+        pub fn classify(
+            &self,
+            total_rules: u32,
+            k: u8,
+            two_r: u32,
+            t: u32,
+            depth: u32,
+        ) -> Result<(Vec<u8>, usize), String> {
+            let sig_len = super::compute_ca_sig_len(depth);
+            let table_len = (k as u32).pow(two_r + 1);
+            let buf_bytes = (total_rules as u64) * (sig_len as u64);
+
+            if buf_bytes == 0 {
+                return Ok((vec![], sig_len as usize));
+            }
+
+            eprintln!(
+                "  GPU CA classify: {} rules, sig_len={}, table_len={}, buf={}KB",
+                total_rules, sig_len, table_len, buf_bytes / 1024
+            );
+
+            let params = CaClassifyParams {
+                total_rules,
+                k: k as u32,
+                two_r,
+                t,
+                depth,
+                sig_len,
+                table_len,
+            };
+
+            // Allocate output buffer
+            let sig_buf = self.device.new_buffer(
+                buf_bytes.max(4),
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            // Dispatch
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&sig_buf), 0);
+            encoder.set_bytes(
+                1,
+                size_of::<CaClassifyParams>() as u64,
+                (&params as *const CaClassifyParams).cast(),
+            );
+
+            let width = self.pipeline.thread_execution_width().max(1);
+            let threads_per_group = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (total_rules as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            encoder.dispatch_thread_groups(groups, threads_per_group);
+            encoder.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+
+            // Read back
+            let raw = unsafe {
+                let ptr = sig_buf.contents() as *const u8;
+                std::slice::from_raw_parts(ptr, buf_bytes as usize)
+            };
+
+            Ok((raw.to_vec(), sig_len as usize))
+        }
+    }
 }
 
 // Re-export
@@ -647,6 +858,44 @@ pub fn run_tournament_gpu(
     _payoff: &[[i32; 2]; 4],
 ) -> Result<Vec<Vec<i64>>, String> {
     Err("Metal not available".to_string())
+}
+
+/// Classify all CA rules on GPU. Returns (flat_signatures, sig_len).
+/// The caller slices flat_signatures into chunks of sig_len per rule.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn classify_ca_gpu(
+    total_rules: u32,
+    k: u8,
+    two_r: u32,
+    t: u32,
+    depth: u32,
+) -> Result<(Vec<u8>, usize), String> {
+    let gpu = metal_impl::MetalCaClassifier::new()?;
+    gpu.classify(total_rules, k, two_r, t, depth)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn classify_ca_gpu(
+    _total_rules: u32,
+    _k: u8,
+    _two_r: u32,
+    _t: u32,
+    _depth: u32,
+) -> Result<(Vec<u8>, usize), String> {
+    Err("Metal not available".to_string())
+}
+
+/// Compute the total signature length for CA classification at a given depth.
+pub fn compute_ca_sig_len(depth: u32) -> u32 {
+    let mut len = 0u32;
+    for history_len in 0..=(depth * 2) {
+        if history_len == 0 {
+            len += 1;
+        } else {
+            len += (2u64.pow(history_len.min(20))).min(256) as u32;
+        }
+    }
+    len
 }
 
 /// Check if Metal is available at runtime.

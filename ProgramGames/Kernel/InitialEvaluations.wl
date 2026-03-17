@@ -19,12 +19,17 @@ PackageExport["ProgramGamesParallelLoad"]
 
 
 PackageScope["$ProgramGamesPackageDirectory"]
+PackageScope["$ProgramGamesRequiredFunctionNames"]
 PackageScope["functions"]
+PackageScope["iCargoBuildAndLoad"]
+PackageScope["iLoadFunctions"]
+PackageScope["iMissingFunctionNames"]
 PackageScope["TMSearchWL"]
 PackageScope["TMClassifyWL"]
 PackageScope["TMTournamentWL"]
 PackageScope["ProgramTournamentWL"]
 PackageScope["TMMaxIndexWL"]
+PackageScope["CAClassifyWL"]
 
 
 (* ::Section::Closed:: *)
@@ -43,6 +48,18 @@ ProgramGamesParallelLoad::usage = "ProgramGamesParallelLoad[] restarts parallel 
 
 
 $ProgramGamesPackageDirectory = DirectoryName[$InputFileName];
+
+$ProgramGamesRequiredFunctionNames = {
+	"tm_search_wl",
+	"tm_classify_wl",
+	"tm_tournament_wl",
+	"program_tournament_wl",
+	"tm_max_index_wl",
+	"ca_classify_wl"
+};
+
+iMissingFunctionNames[funcs_Association] :=
+	Select[$ProgramGamesRequiredFunctionNames, !KeyExistsQ[funcs, #] &];
 
 
 (* ::Section::Closed:: *)
@@ -69,7 +86,15 @@ ProgramGamesSetup[] := (
 	SetEnvironment[
 		"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
 	];
-	ExtensionCargo`CargoBuild[PacletObject["WolframInstitute/ProgramGames"]]
+	With[{result = ExtensionCargo`CargoBuild[PacletObject["WolframInstitute/ProgramGames"]]},
+		(* Directly reload functions from the newly built library.
+		   We cannot just do functions=. here because the initial
+		   SetDelayed (functions := functions = ...) was already
+		   replaced by Set on first evaluation, so Unset would
+		   leave functions permanently undefined. *)
+		functions = iLoadFunctions[];
+		result
+	]
 )
 
 
@@ -78,9 +103,8 @@ ProgramGamesSetup[] := (
 
 
 ProgramGamesParallelLoad[] := (
-	CloseKernels[];
-	LaunchKernels[];
 	ParallelEvaluate[
+		Quiet[PacletDataRebuild[], PacletDataRebuild::lock];
 		<< WolframInstitute`TuringMachine`;
 		<< WolframInstitute`ProgramGames`
 	]
@@ -91,54 +115,82 @@ ProgramGamesParallelLoad[] := (
 (*Cargo Library Loading*)
 
 
-functions := functions = (
-	If[!PacletObjectQ[PacletObject["PacletExtensions"]],
-		PacletInstall["https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet"]
-	];
-	Needs["ExtensionCargo`"];
-	SetEnvironment[
-		"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
-	];
-	Replace[
-		ExtensionCargo`CargoLoad[
-			PacletObject["WolframInstitute/ProgramGames"],
-			"Functions"
-		],
-		Except[_ ? AssociationQ] :> Replace[
-			ExtensionCargo`CargoBuild[PacletObject["WolframInstitute/ProgramGames"]], {
-				f : Except[{__ ? FileExistsQ}] :> (
-					Function @ Function @ Failure["CargoBuildError", <|
-						"MessageTemplate" -> "Cargo build failed",
-						"Return" -> f
-					|>]
-				),
-				files_ :> Replace[
-					ExtensionCargo`CargoLoad[files, "Functions"],
-					f : Except[_ ? AssociationQ] :>
-						Function @ Function @ Failure["CargoLoadError", <|
-							"MessageTemplate" -> "Cargo load failed",
-							"Return" -> f
-						|>]
-				]
+iCargoBuildAndLoad[paclet_] := Replace[
+	ExtensionCargo`CargoBuild[paclet], {
+		f : Except[{__ ? FileExistsQ}] :> (
+			Function @ Function @ Failure["CargoBuildError", <|
+				"MessageTemplate" -> "Cargo build failed",
+				"Return" -> f
+			|>]
+		),
+		files_ :> Replace[
+			ExtensionCargo`CargoLoad[files, "Functions"],
+			f : Except[_ ? AssociationQ] :>
+				Function @ Function @ Failure["CargoLoadError", <|
+					"MessageTemplate" -> "Cargo load failed",
+					"Return" -> f
+				|>]
+		]
+	}
+];
+
+iLoadFunctions[] := With[{paclet = PacletObject["WolframInstitute/ProgramGames"]},
+	(
+		If[!PacletObjectQ[PacletObject["PacletExtensions"]],
+			PacletInstall["https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet"]
+		];
+		Needs["ExtensionCargo`"];
+		SetEnvironment[
+			"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
+		];
+		(* Do not trust CargoLoad just because it returns an Association.
+		   ResourceDefinition.nb builds can embed stale cargo manifests/targets
+		   that are missing newer exports such as the CA functions. *)
+		Replace[
+			ExtensionCargo`CargoLoad[
+				paclet,
+				"Functions"
+			], {
+				funcs_ ? AssociationQ /; iMissingFunctionNames[funcs] === {} :> funcs,
+				_ :> iCargoBuildAndLoad[paclet]
 			}
 		]
-	]
-) // Replace[{
+	)
+] // Replace[{
 	funcs_ ? AssociationQ :>
-		Association @ KeyValueMap[
-			#1 -> Composition[
-				Replace[LibraryFunctionError[error_, code_] :>
-					Failure["RustError", <|
-						"MessageTemplate" -> "Rust error: `` (``)",
-						"MessageParameters" -> {error, code},
-						"Error" -> error, "ErrorCode" -> code, "Function" -> #1
-					|>]
-				],
-				#2
-			] &,
-			funcs
+		With[{
+			wrapped = Association @ KeyValueMap[
+				#1 -> Composition[
+					Replace[LibraryFunctionError[error_, code_] :>
+						Failure["RustError", <|
+							"MessageTemplate" -> "Rust error: `` (``)",
+							"MessageParameters" -> {error, code},
+							"Error" -> error, "ErrorCode" -> code, "Function" -> #1
+						|>]
+					],
+					#2
+				] &,
+				funcs
+			],
+			missing = iMissingFunctionNames[funcs]
+		},
+			Join[
+				wrapped,
+				AssociationThread[
+					missing,
+					With[{name = #},
+						Function[Failure["MissingCargoFunction", <|
+							"MessageTemplate" -> "Rust function `` is missing from the loaded cargo manifest.",
+							"MessageParameters" -> {name},
+							"Function" -> name
+						|>]]
+					] & /@ missing
+				]
+			]
 		]
 }]
+
+functions := functions = iLoadFunctions[]
 
 
 (* ::Section::Closed:: *)
@@ -150,3 +202,4 @@ TMClassifyWL := functions["tm_classify_wl"]
 TMTournamentWL := functions["tm_tournament_wl"]
 ProgramTournamentWL := functions["program_tournament_wl"]
 TMMaxIndexWL := functions["tm_max_index_wl"]
+CAClassifyWL := functions["ca_classify_wl"]

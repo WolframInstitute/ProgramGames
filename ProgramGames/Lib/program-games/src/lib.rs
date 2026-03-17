@@ -705,6 +705,138 @@ pub fn tm_max_index_wl(states: i64, symbols: i64) -> i64 {
     }
 }
 
+/// Classify CA rules by behavioral equivalence. Returns JSON with groups.
+/// sample=0 means exhaustive (all rules), sample>0 means random sample of that size.
+/// Uses Metal GPU when available, falls back to CPU (Rayon).
+#[wll::export]
+pub fn ca_classify_wl(
+    k: i64,
+    r_numer: i64,
+    r_denom: i64,
+    t: i64,
+    depth: i64,
+    sample: i64,
+) -> String {
+    let k = k as u8;
+    let r_f = r_numer as f32 / r_denom as f32;
+    let two_r = (2.0 * r_f).round() as u32;
+    let t = t as u32;
+    let depth = depth as u32;
+
+    let neighborhood_size = (two_r + 1) as u32;
+    let num_neighborhoods = (k as u64).pow(neighborhood_size);
+    let total_rules = match (k as u64).checked_pow(num_neighborhoods as u32) {
+        Some(n) => n,
+        None => return "{\"error\":\"rule space overflow\"}".to_string(),
+    };
+
+    // Build candidate list: exhaustive or random sample
+    let candidates: Vec<u64> = if sample > 0 {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let target = (sample as u64).min(total_rules);
+        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(42).wrapping_add(0xBu64);
+        while (seen.len() as u64) < target {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let hi = rng_state >> 32;
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let lo = rng_state >> 32;
+            let full = (hi << 32) | lo;
+            let idx = full % total_rules;
+            seen.insert(idx);
+        }
+        let mut v: Vec<u64> = seen.into_iter().collect();
+        v.sort();
+        v
+    } else {
+        (0..total_rules).collect()
+    };
+
+    let num_candidates = candidates.len() as u64;
+
+    // Try Metal GPU for exhaustive enumeration (contiguous 0..total_rules)
+    if sample == 0 && total_rules <= u32::MAX as u64 {
+        match gpu::classify_ca_gpu(total_rules as u32, k, two_r, t, depth) {
+            Ok((flat_sigs, sig_len)) => {
+                return ca_classify_group_signatures_indexed(
+                    &flat_sigs, sig_len, &candidates, total_rules,
+                );
+            }
+            Err(e) => {
+                eprintln!("  CA classify GPU failed, using CPU: {}", e);
+            }
+        }
+    }
+
+    // CPU path: build signatures with Rayon
+    let sig_len = gpu::compute_ca_sig_len(depth) as usize;
+    let mut flat_sigs = vec![0u8; num_candidates as usize * sig_len];
+
+    flat_sigs
+        .par_chunks_mut(sig_len)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let rule_code = candidates[i];
+            let rule_table = strategy::decode_ca_rule_table(rule_code, k, two_r);
+            let mut sig_idx = 0usize;
+            for history_len in 0..=(depth * 2) {
+                let num_histories = if history_len == 0 { 1 } else { (2u64).pow(history_len.min(20)) };
+                let limit = num_histories.min(256);
+                for h in 0..limit {
+                    let history_bits: Vec<u8> = (0..history_len)
+                        .map(|bit| ((h >> bit) & 1) as u8)
+                        .collect();
+                    chunk[sig_idx] = strategy::ca_move(&rule_table, k, two_r, t, &history_bits);
+                    sig_idx += 1;
+                }
+            }
+        });
+
+    ca_classify_group_signatures_indexed(&flat_sigs, sig_len, &candidates, total_rules)
+}
+
+/// Group rules by their behavioral signatures and return JSON.
+/// `candidates` maps index -> rule_code for the rules that were actually classified.
+fn ca_classify_group_signatures_indexed(
+    flat_sigs: &[u8],
+    sig_len: usize,
+    candidates: &[u64],
+    total_rules: u64,
+) -> String {
+    use std::collections::HashMap;
+    let mut groups: HashMap<&[u8], Vec<u64>> = HashMap::new();
+    for (i, &rule_code) in candidates.iter().enumerate() {
+        let start = i * sig_len;
+        let sig = &flat_sigs[start..start + sig_len];
+        groups.entry(sig).or_default().push(rule_code);
+    }
+
+    let representatives: Vec<u64> = groups.values().map(|v| v[0]).collect();
+    let group_entries: Vec<serde_json::Value> = groups.iter().map(|(_, members)| {
+        serde_json::json!({
+            "representative": members[0],
+            "members": members,
+            "size": members.len()
+        })
+    }).collect();
+
+    let sampled = candidates.len() as u64;
+    let output = serde_json::json!({
+        "representatives": representatives,
+        "groups": group_entries,
+        "unique_behaviors": groups.len(),
+        "total_rules": total_rules,
+        "sampled_rules": sampled,
+        "reduction_factor": if groups.len() > 0 { sampled as f64 / groups.len() as f64 } else { 0.0 }
+    });
+
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -989,5 +1121,174 @@ mod tests {
     #[test]
     fn checked_pow_overflow() {
         assert_eq!(checked_pow(2, 128), None);
+    }
+
+    // ── CA classify ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ca_classify_k2_r_half_gpu_matches_cpu() {
+        // k=2, r=1/2: 16 rules. Compare GPU vs CPU signatures.
+        let k: u8 = 2;
+        let two_r: u32 = 1;
+        let t: u32 = 10;
+        let depth: u32 = 4;
+        let total_rules: u32 = 16;
+        let sig_len = gpu::compute_ca_sig_len(depth) as usize;
+
+        // CPU signatures
+        let mut cpu_sigs = vec![0u8; total_rules as usize * sig_len];
+        for rule_code in 0..total_rules as u64 {
+            let rule_table = strategy::decode_ca_rule_table(rule_code, k, two_r);
+            let base = rule_code as usize * sig_len;
+            let mut idx = 0;
+            for history_len in 0..=(depth * 2) {
+                let num = if history_len == 0 { 1 } else { (2u64).pow(history_len.min(20)) };
+                let limit = num.min(256);
+                for h in 0..limit {
+                    let bits: Vec<u8> = (0..history_len)
+                        .map(|bit| ((h >> bit) & 1) as u8)
+                        .collect();
+                    cpu_sigs[base + idx] = strategy::ca_move(&rule_table, k, two_r, t, &bits);
+                    idx += 1;
+                }
+            }
+        }
+
+        // GPU signatures
+        match gpu::classify_ca_gpu(total_rules, k, two_r, t, depth) {
+            Ok((gpu_sigs, gpu_sig_len)) => {
+                assert_eq!(gpu_sig_len, sig_len);
+                assert_eq!(gpu_sigs.len(), cpu_sigs.len());
+                for rule in 0..total_rules as usize {
+                    let start = rule * sig_len;
+                    let cpu_slice = &cpu_sigs[start..start + sig_len];
+                    let gpu_slice = &gpu_sigs[start..start + sig_len];
+                    assert_eq!(
+                        cpu_slice, gpu_slice,
+                        "GPU/CPU mismatch for rule {}", rule
+                    );
+                }
+                eprintln!("  GPU vs CPU: all {} rules match (sig_len={})", total_rules, sig_len);
+            }
+            Err(e) => {
+                eprintln!("  GPU not available, skipping comparison: {}", e);
+            }
+        }
+    }
+
+    // ── CA classify verification ────────────────────────────────────────
+
+    #[test]
+    fn ca_classify_k2_all_unique() {
+        // For k=2, every rule is unique because table entries are already
+        // in {0,1} and %2 is identity.
+        // k=2, r=1/2 (numer=1, denom=2): 16 rules
+        let result_str = ca_classify_wl(2, 1, 2, 10, 4, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let unique = parsed["unique_behaviors"].as_u64().unwrap();
+        let total = parsed["total_rules"].as_u64().unwrap();
+        assert_eq!(total, 16);
+        assert_eq!(unique, 16, "k=2 r=1/2: all 16 rules should be unique");
+
+        // k=2, r=1 (numer=1, denom=1): 256 rules
+        let result_str = ca_classify_wl(2, 1, 1, 10, 4, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let unique = parsed["unique_behaviors"].as_u64().unwrap();
+        let total = parsed["total_rules"].as_u64().unwrap();
+        assert_eq!(total, 256);
+        assert_eq!(unique, 256, "k=2 r=1: all 256 rules should be unique");
+    }
+
+    #[test]
+    fn ca_classify_k3_r_half_has_equivalences() {
+        // k=3, r=1/2: output %2 collapses 0 and 2, so there must be
+        // fewer unique behaviors than total rules.
+        // Total = 3^(3^2) = 3^9 = 19683
+        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let total = parsed["total_rules"].as_u64().unwrap();
+        let unique = parsed["unique_behaviors"].as_u64().unwrap();
+        assert_eq!(total, 19683, "CA(3,1/2) should have 19683 total rules");
+        assert!(
+            unique < total,
+            "k=3 should have equivalences: got {} unique out of {} total",
+            unique, total
+        );
+        assert!(
+            unique > 512,
+            "unique count {} should exceed 512 (the number of distinct %2 tables for 9 entries)",
+            unique
+        );
+        eprintln!("  CA(3,1/2): {} unique out of {} total (reduction {:.2}x)",
+            unique, total, total as f64 / unique as f64);
+    }
+
+    #[test]
+    fn ca_classify_k2_sample_all_unique() {
+        // Sampling k=2 rules should still find all unique (no collisions)
+        // since every k=2 rule is behaviorally distinct.
+        // Use a small sample from a large space (k=2, r=3/2: 65536 rules)
+        let result_str = ca_classify_wl(2, 3, 2, 10, 4, 1000);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let sampled = parsed["sampled_rules"].as_u64().unwrap();
+        let unique = parsed["unique_behaviors"].as_u64().unwrap();
+        assert_eq!(sampled, 1000);
+        assert_eq!(
+            unique, sampled,
+            "k=2 sampled: all {} samples should be unique, got {}",
+            sampled, unique
+        );
+    }
+
+    #[test]
+    fn ca_classify_k4_r_half_has_equivalences() {
+        // k=4, r=1/2: output %2 collapses {0,2}->0, {1,3}->1
+        // Total = 4^(4^2) = 4^16 = 4294967296 (too big for exhaustive)
+        // Sample and verify there ARE equivalences
+        let result_str = ca_classify_wl(4, 1, 2, 10, 4, 10000);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let sampled = parsed["sampled_rules"].as_u64().unwrap();
+        let unique = parsed["unique_behaviors"].as_u64().unwrap();
+        assert_eq!(sampled, 10000);
+        assert!(
+            unique < sampled,
+            "k=4 should have equivalences in 10k samples: got {} unique",
+            unique
+        );
+        eprintln!("  CA(4,1/2) sampled: {} unique out of {} (reduction {:.2}x)",
+            unique, sampled, sampled as f64 / unique as f64);
+    }
+
+    #[test]
+    fn ca_classify_reduction_factor_correct() {
+        // Verify reduction_factor = sampled_rules / unique_behaviors
+        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let sampled = parsed["sampled_rules"].as_f64().unwrap();
+        let unique = parsed["unique_behaviors"].as_f64().unwrap();
+        let reduction = parsed["reduction_factor"].as_f64().unwrap();
+        let expected = sampled / unique;
+        assert!(
+            (reduction - expected).abs() < 0.001,
+            "reduction_factor {} should equal sampled/unique = {}",
+            reduction, expected
+        );
+    }
+
+    #[test]
+    fn ca_classify_group_sizes_sum_to_sampled() {
+        // Every classified rule should appear in exactly one group
+        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+        let sampled = parsed["sampled_rules"].as_u64().unwrap();
+        let groups = parsed["groups"].as_array().unwrap();
+        let total_in_groups: u64 = groups.iter()
+            .map(|g| g["size"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            total_in_groups, sampled,
+            "sum of group sizes {} should equal sampled rules {}",
+            total_in_groups, sampled
+        );
     }
 }
