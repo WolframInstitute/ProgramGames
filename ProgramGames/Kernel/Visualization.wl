@@ -57,6 +57,7 @@ $DefaultSpaces = {{2, 2}, {3, 2}, {2, 3}, {4, 2}, {3, 3}, {5, 2}};
 
 
 SpaceSurveyTable[opts : OptionsPattern[]] := SpaceSurveyTable[$DefaultSpaces, opts]
+SpaceSurveyTable[space : {_Integer, _Integer}, opts : OptionsPattern[]] := SpaceSurveyTable[{space}, opts]
 SpaceSurveyTable[spaces_List, opts : OptionsPattern[]] :=
 	Module[{results, maxsteps, depth, sample},
 		maxsteps = OptionValue["MaxSteps"];
@@ -125,6 +126,7 @@ Options[ClassificationTable] = {
 
 
 ClassificationTable[opts : OptionsPattern[]] := ClassificationTable[$DefaultSpaces, opts]
+ClassificationTable[space : {_Integer, _Integer}, opts : OptionsPattern[]] := ClassificationTable[{space}, opts]
 ClassificationTable[spaces_List, opts : OptionsPattern[]] :=
 	Module[{results, maxsteps, depth, sample},
 		maxsteps = OptionValue["MaxSteps"];

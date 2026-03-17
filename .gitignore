@@ -1,5 +1,6 @@
 # Rust build artifacts
 target/
+Cargo.lock
 
 # macOS
 .DS_Store
@@ -9,8 +10,7 @@ target/
 *.mx
 *.paclet
 build/
+Binaries/
 
 # Vim stuff
 *.sw?
-
-MacOSX-ARM64/

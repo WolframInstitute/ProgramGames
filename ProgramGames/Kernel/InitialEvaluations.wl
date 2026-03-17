@@ -11,6 +11,7 @@ PackageImport["GeneralUtilities`"]
 
 PackageExport["TuringMachineMaxIndex"]
 PackageExport["ProgramGamesSetup"]
+PackageExport["ProgramGamesParallelLoad"]
 
 
 (* ::Section::Closed:: *)
@@ -33,6 +34,8 @@ PackageScope["TMMaxIndexWL"]
 TuringMachineMaxIndex::usage = "TuringMachineMaxIndex[s, k] returns the maximum TM index for (s,k) space: (2sk)^(sk) - 1.";
 
 ProgramGamesSetup::usage = "ProgramGamesSetup[] installs required dependencies and builds the Rust library.";
+
+ProgramGamesParallelLoad::usage = "ProgramGamesParallelLoad[] restarts parallel kernels and loads ProgramGames on all of them.";
 
 
 (* ::Section::Closed:: *)
@@ -67,6 +70,20 @@ ProgramGamesSetup[] := (
 		"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
 	];
 	ExtensionCargo`CargoBuild[PacletObject["WolframInstitute/ProgramGames"]]
+)
+
+
+(* ::Section::Closed:: *)
+(*Parallel Loading*)
+
+
+ProgramGamesParallelLoad[] := (
+	CloseKernels[];
+	LaunchKernels[];
+	ParallelEvaluate[
+		<< WolframInstitute`TuringMachine`;
+		<< WolframInstitute`ProgramGames`
+	]
 )
 
 
