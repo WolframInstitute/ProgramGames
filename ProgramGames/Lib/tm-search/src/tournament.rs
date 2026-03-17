@@ -1,0 +1,840 @@
+//! CPU tournament engine for iterated TM games.
+//!
+//! Each pair of TMs plays an iterated game for `rounds` rounds.
+//! Both TMs see the SAME flattened history as their tape input.
+//! History is maintained as a bit array: [a1, b1, a2, b2, ...].
+//!
+//! Also supports mixed-strategy tournaments with FSM and CA strategies.
+
+use rayon::prelude::*;
+use serde::Serialize;
+use std::io::{self, BufRead, BufWriter, Write};
+use std::path::PathBuf;
+
+use crate::strategy::{play_game, StrategyRunner, StrategySpec};
+use crate::TmTransition;
+
+// ── Payoff parsing ──────────────────────────────────────────────────────────
+
+/// Payoff matrix: payoff[move_a * 2 + move_b] = [score_a, score_b]
+pub type Payoff = [[i32; 2]; 4];
+
+/// Parse a game name or custom payoff string into a Payoff matrix.
+/// Index: CC=0, CD=1, DC=2, DD=3 (move_a * 2 + move_b, 0=cooperate, 1=defect)
+pub fn parse_game(game: &str) -> Result<Payoff, String> {
+    match game.trim().to_lowercase().as_str() {
+        "pd" => Ok([
+            [-1, -1],  // CC
+            [-3, 0],   // CD
+            [0, -3],   // DC
+            [-2, -2],  // DD
+        ]),
+        "chicken" => Ok([
+            [0, 0],      // CC
+            [-1, 1],     // CD
+            [1, -1],     // DC
+            [-10, -10],  // DD
+        ]),
+        custom => {
+            let vals: Vec<i32> = custom
+                .split(',')
+                .map(|s| s.trim().parse::<i32>().map_err(|e| format!("bad payoff '{}': {}", s.trim(), e)))
+                .collect::<Result<Vec<_>, _>>()?;
+            if vals.len() != 8 {
+                return Err(format!(
+                    "custom payoff needs 8 values (CC_a,CC_b,CD_a,CD_b,DC_a,DC_b,DD_a,DD_b), got {}",
+                    vals.len()
+                ));
+            }
+            Ok([
+                [vals[0], vals[1]],
+                [vals[2], vals[3]],
+                [vals[4], vals[5]],
+                [vals[6], vals[7]],
+            ])
+        }
+    }
+}
+
+// ── TM ID parsing ───────────────────────────────────────────────────────────
+
+pub fn parse_ids(ids: &Option<String>, ids_file: &Option<PathBuf>) -> Result<Vec<u64>, String> {
+    if let Some(inline) = ids {
+        return inline
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<u64>()
+                    .map_err(|e| format!("bad TM id '{}': {}", s.trim(), e))
+            })
+            .collect();
+    }
+    if let Some(path) = ids_file {
+        let reader: Box<dyn BufRead> = if path.to_string_lossy() == "-" {
+            Box::new(io::stdin().lock())
+        } else {
+            let f = std::fs::File::open(path)
+                .map_err(|e| format!("cannot open {}: {}", path.display(), e))?;
+            Box::new(io::BufReader::new(f))
+        };
+        let mut ids = Vec::new();
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("read error: {}", e))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            ids.push(
+                trimmed
+                    .parse::<u64>()
+                    .map_err(|e| format!("bad TM id '{}': {}", trimmed, e))?,
+            );
+        }
+        return Ok(ids);
+    }
+    Err("must provide --ids or --ids-file (use '-' for stdin)".into())
+}
+
+// ── Tape-based TM runner ────────────────────────────────────────────────────
+
+/// Run a TM on a pre-built tape (history bits, MSD-first).
+/// Returns (halted, output_mod2).
+///
+/// Tape layout: [0 0 ... 0 | history[0] history[1] ... history[n-1]]
+///               ^left_pad   ^-- tape data
+///
+/// Head starts at rightmost history bit.
+/// Halts when moving right past the last position.
+/// Returns 0 (cooperate) on timeout / no-halt.
+pub fn run_tm_on_tape(
+    transitions: &[TmTransition],
+    symbols: u8,
+    tape_data: &[u8],
+    max_steps: u32,
+) -> (bool, u8) {
+    let left_pad = max_steps as usize + 1;
+    let tape_len = left_pad + tape_data.len();
+    let mut buf = vec![0u8; tape_len];
+    buf[left_pad..].copy_from_slice(tape_data);
+
+    let mut head = if tape_data.is_empty() {
+        // Empty tape: head at the single blank position
+        left_pad.saturating_sub(1)
+    } else {
+        tape_len - 1
+    };
+    let mut state: u16 = 1;
+    let k = symbols as usize;
+
+    for _ in 0..max_steps {
+        let read = buf[head] as usize;
+        let idx = (state as usize - 1) * k + read;
+        if idx >= transitions.len() {
+            return (false, 0);
+        }
+        let trans = transitions[idx];
+        buf[head] = trans.write;
+
+        if trans.move_right {
+            if head + 1 == tape_len {
+                return (true, buf[tape_len - 1] % 2);
+            }
+            head += 1;
+        } else {
+            if head == 0 {
+                return (false, 0); // ran off left edge
+            }
+            head -= 1;
+        }
+
+        state = trans.next;
+        if state == 0 {
+            return (false, 0);
+        }
+    }
+    (false, 0) // timeout
+}
+
+// ── CPU game play ───────────────────────────────────────────────────────────
+
+/// Play one iterated game between two TMs.
+/// Returns (score_a, score_b).
+pub fn play_game_cpu(
+    trans_a: &[TmTransition],
+    trans_b: &[TmTransition],
+    symbols: u8,
+    max_steps: u32,
+    rounds: u32,
+    payoff: &Payoff,
+) -> (i64, i64) {
+    let mut history: Vec<u8> = Vec::with_capacity(2 * rounds as usize);
+    let mut score_a = 0i64;
+    let mut score_b = 0i64;
+
+    for round in 0..rounds {
+        let (move_a, move_b) = if round == 0 {
+            (0u8, 0u8) // cooperate on empty history
+        } else {
+            let (ha, out_a) = run_tm_on_tape(trans_a, symbols, &history, max_steps);
+            let (hb, out_b) = run_tm_on_tape(trans_b, symbols, &history, max_steps);
+            let ma = if ha { out_a % 2 } else { 1 }; // timeout -> defect
+            let mb = if hb { out_b % 2 } else { 1 };
+            (ma, mb)
+        };
+
+        history.push(move_a);
+        history.push(move_b);
+
+        let idx = (move_a as usize) * 2 + move_b as usize;
+        score_a += payoff[idx][0] as i64;
+        score_b += payoff[idx][1] as i64;
+    }
+
+    (score_a, score_b)
+}
+
+// ── CPU tournament ──────────────────────────────────────────────────────────
+
+/// Build all ordered pairs (i, j) where i != j (Tuples[ids, 2] in WL).
+pub fn all_pairs(n: usize) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::with_capacity(n * (n - 1));
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                pairs.push((i, j));
+            }
+        }
+    }
+    pairs
+}
+
+/// Run the full tournament on CPU using rayon.
+/// Returns score_matrix[i][j] = score of ids[i] when playing against ids[j].
+pub fn run_tournament_cpu(
+    ids: &[u64],
+    states: u16,
+    symbols: u8,
+    max_steps: u32,
+    rounds: u32,
+    payoff: &Payoff,
+) -> Vec<Vec<i64>> {
+    let n = ids.len();
+    let transitions: Vec<Vec<TmTransition>> = ids
+        .iter()
+        .map(|&id| crate::decode_tm(id, states, symbols))
+        .collect();
+
+    let pairs = all_pairs(n);
+
+    eprintln!(
+        "  CPU tournament: {} machines, {} pairs, {} rounds",
+        n,
+        pairs.len(),
+        rounds
+    );
+
+    // Parallel over pairs
+    let results: Vec<((usize, usize), (i64, i64))> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            let (sa, sb) = play_game_cpu(
+                &transitions[i],
+                &transitions[j],
+                symbols,
+                max_steps,
+                rounds,
+                payoff,
+            );
+            ((i, j), (sa, sb))
+        })
+        .collect();
+
+    // Assemble score matrix
+    let mut matrix = vec![vec![0i64; n]; n];
+    for ((i, j), (sa, _sb)) in &results {
+        matrix[*i][*j] = *sa;
+    }
+    matrix
+}
+
+// ── Output ──────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct TournamentOutput {
+    pub ids: Vec<u64>,
+    pub rounds: u32,
+    pub game: String,
+    pub states: u16,
+    pub symbols: u8,
+    pub num_machines: usize,
+    pub num_pairs: usize,
+    pub scores: Vec<Vec<i64>>,
+    pub pairwise: Vec<PairResult>,
+    pub ranking: Vec<RankEntry>,
+}
+
+#[derive(Serialize)]
+pub struct PairResult {
+    pub i: usize,
+    pub j: usize,
+    pub id_a: u64,
+    pub id_b: u64,
+    pub score_a: i64,
+    pub score_b: i64,
+}
+
+#[derive(Serialize)]
+pub struct RankEntry {
+    pub id: u64,
+    pub total: i64,
+    pub mean: f64,
+    pub median: f64,
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+}
+
+pub fn build_output(
+    ids: &[u64],
+    scores: Vec<Vec<i64>>,
+    rounds: u32,
+    game: &str,
+    states: u16,
+    symbols: u8,
+) -> TournamentOutput {
+    let n = ids.len();
+
+    // Pairwise results
+    let mut pairwise = Vec::with_capacity(n * (n - 1));
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                pairwise.push(PairResult {
+                    i,
+                    j,
+                    id_a: ids[i],
+                    id_b: ids[j],
+                    score_a: scores[i][j],
+                    score_b: scores[j][i],
+                });
+            }
+        }
+    }
+
+    // Build ranking with mean, median, wins/losses/draws
+    let mut ranking: Vec<RankEntry> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let opponents: Vec<i64> = (0..n).filter(|&j| j != i).map(|j| scores[i][j]).collect();
+            let total: i64 = opponents.iter().sum();
+            let mean = if opponents.is_empty() { 0.0 } else { total as f64 / opponents.len() as f64 };
+            let median = compute_median(&opponents);
+            let mut wins = 0usize;
+            let mut losses = 0usize;
+            let mut draws = 0usize;
+            for j in 0..n {
+                if j == i { continue; }
+                if scores[i][j] > scores[j][i] { wins += 1; }
+                else if scores[i][j] < scores[j][i] { losses += 1; }
+                else { draws += 1; }
+            }
+            RankEntry { id, total, mean, median, wins, losses, draws }
+        })
+        .collect();
+    ranking.sort_by(|a, b| b.total.cmp(&a.total));
+
+    TournamentOutput {
+        ids: ids.to_vec(),
+        rounds,
+        game: game.to_string(),
+        states,
+        symbols,
+        num_machines: n,
+        num_pairs: n * (n - 1),
+        scores,
+        pairwise,
+        ranking,
+    }
+}
+
+fn compute_median(vals: &[i64]) -> f64 {
+    if vals.is_empty() { return 0.0; }
+    let mut sorted = vals.to_vec();
+    sorted.sort();
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2] as f64
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
+    }
+}
+
+pub fn write_output(output: &TournamentOutput) {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    serde_json::to_writer_pretty(&mut out, output).ok();
+    out.write_all(b"\n").ok();
+    out.flush().ok();
+}
+
+// ── Strategy spec parsing ────────────────────────────────────────────────────
+
+/// Parse strategy specs from an NDJSON file (one JSON object per line).
+/// Use path "-" for stdin.
+pub fn parse_strategies_file(path: &PathBuf) -> Result<Vec<StrategySpec>, String> {
+    let reader: Box<dyn BufRead> = if path.to_string_lossy() == "-" {
+        Box::new(io::stdin().lock())
+    } else {
+        let f = std::fs::File::open(path)
+            .map_err(|e| format!("cannot open {}: {}", path.display(), e))?;
+        Box::new(io::BufReader::new(f))
+    };
+    let mut specs = Vec::new();
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("read error: {}", e))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let spec: StrategySpec = serde_json::from_str(trimmed)
+            .map_err(|e| format!("line {}: bad strategy spec '{}': {}", line_num + 1, trimmed, e))?;
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+/// Parse strategy specs from an inline NDJSON string.
+pub fn parse_strategies_inline(ndjson: &str) -> Result<Vec<StrategySpec>, String> {
+    let mut specs = Vec::new();
+    for (line_num, line) in ndjson.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let spec: StrategySpec = serde_json::from_str(trimmed)
+            .map_err(|e| format!("line {}: bad strategy spec '{}': {}", line_num + 1, trimmed, e))?;
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+// ── Mixed-strategy tournament ────────────────────────────────────────────────
+
+/// Output for mixed-strategy tournaments.
+#[derive(Serialize)]
+pub struct MixedTournamentOutput {
+    pub strategies: Vec<String>,
+    pub rounds: u32,
+    pub game: String,
+    pub num_strategies: usize,
+    pub num_pairs: usize,
+    pub scores: Vec<Vec<i64>>,
+    pub pairwise: Vec<MixedPairResult>,
+    pub ranking: Vec<MixedRankEntry>,
+}
+
+#[derive(Serialize)]
+pub struct MixedPairResult {
+    pub i: usize,
+    pub j: usize,
+    pub label_a: String,
+    pub label_b: String,
+    pub score_a: i64,
+    pub score_b: i64,
+}
+
+#[derive(Serialize)]
+pub struct MixedRankEntry {
+    pub label: String,
+    pub total: i64,
+    pub mean: f64,
+    pub median: f64,
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+}
+
+/// Run a mixed-strategy tournament on CPU using rayon.
+/// Returns (survivor_indices, score_matrix) where the matrix only contains
+/// strategies that halted on every input. Non-halting strategies are excluded.
+pub fn run_mixed_tournament_cpu(
+    specs: &[StrategySpec],
+    rounds: u32,
+    payoff: &Payoff,
+) -> (Vec<usize>, Vec<Vec<i64>>) {
+    let n = specs.len();
+    let pairs = all_pairs(n);
+
+    eprintln!(
+        "  CPU mixed tournament: {} strategies, {} pairs, {} rounds",
+        n,
+        pairs.len(),
+        rounds
+    );
+
+    // Parallel over pairs. Each thread creates its own runners.
+    // Collect which strategies failed to halt.
+    use std::sync::Mutex;
+    let failed_set: Mutex<std::collections::HashSet<usize>> = Mutex::new(std::collections::HashSet::new());
+
+    let results: Vec<((usize, usize), Option<(i64, i64)>)> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            // Skip if either player already known to be failed
+            {
+                let fs = failed_set.lock().unwrap();
+                if fs.contains(&i) || fs.contains(&j) {
+                    return ((i, j), None);
+                }
+            }
+            let mut runner_a = StrategyRunner::new(&specs[i]);
+            let mut runner_b = StrategyRunner::new(&specs[j]);
+            let (result, failed_flag) = play_game(&mut runner_a, &mut runner_b, rounds, payoff);
+            if failed_flag != 0 {
+                let mut fs = failed_set.lock().unwrap();
+                if failed_flag & 1 != 0 { fs.insert(i); }
+                if failed_flag & 2 != 0 { fs.insert(j); }
+            }
+            ((i, j), result)
+        })
+        .collect();
+
+    let failed = failed_set.into_inner().unwrap();
+    if !failed.is_empty() {
+        let failed_labels: Vec<String> = failed.iter()
+            .map(|&i| specs[i].label())
+            .collect();
+        eprintln!("  Excluded {} non-halting strategies: {:?}", failed.len(), failed_labels);
+    }
+
+    // Build list of surviving indices
+    let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
+    let m = survivors.len();
+
+    // Build compact score matrix with only survivors
+    let mut matrix = vec![vec![0i64; m]; m];
+    for ((i, j), result) in &results {
+        if let Some((sa, _sb)) = result {
+            if !failed.contains(i) && !failed.contains(j) {
+                let si = survivors.iter().position(|&x| x == *i).unwrap();
+                let sj = survivors.iter().position(|&x| x == *j).unwrap();
+                matrix[si][sj] = *sa;
+            }
+        }
+    }
+
+    // Return only surviving specs and the compact matrix
+    (survivors, matrix)
+}
+
+/// Build output for a mixed-strategy tournament.
+pub fn build_mixed_output(
+    specs: &[StrategySpec],
+    scores: Vec<Vec<i64>>,
+    rounds: u32,
+    game: &str,
+) -> MixedTournamentOutput {
+    let n = specs.len();
+    let labels: Vec<String> = specs.iter().map(|s| s.label()).collect();
+
+    // Pairwise results
+    let mut pairwise = Vec::with_capacity(n * (n - 1));
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                pairwise.push(MixedPairResult {
+                    i,
+                    j,
+                    label_a: labels[i].clone(),
+                    label_b: labels[j].clone(),
+                    score_a: scores[i][j],
+                    score_b: scores[j][i],
+                });
+            }
+        }
+    }
+
+    let mut ranking: Vec<MixedRankEntry> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let opponents: Vec<i64> = (0..n).filter(|&j| j != i).map(|j| scores[i][j]).collect();
+            let total: i64 = opponents.iter().sum();
+            let mean = if opponents.is_empty() { 0.0 } else { total as f64 / opponents.len() as f64 };
+            let median = compute_median(&opponents);
+            let mut wins = 0usize;
+            let mut losses = 0usize;
+            let mut draws = 0usize;
+            for j in 0..n {
+                if j == i { continue; }
+                if scores[i][j] > scores[j][i] { wins += 1; }
+                else if scores[i][j] < scores[j][i] { losses += 1; }
+                else { draws += 1; }
+            }
+            MixedRankEntry {
+                label: label.clone(),
+                total,
+                mean,
+                median,
+                wins,
+                losses,
+                draws,
+            }
+        })
+        .collect();
+    ranking.sort_by(|a, b| b.total.cmp(&a.total));
+
+    MixedTournamentOutput {
+        strategies: labels,
+        rounds,
+        game: game.to_string(),
+        num_strategies: n,
+        num_pairs: n * (n - 1),
+        scores,
+        pairwise,
+        ranking,
+    }
+}
+
+/// Write mixed tournament output as pretty JSON to stdout.
+pub fn write_mixed_output(output: &MixedTournamentOutput) {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    serde_json::to_writer_pretty(&mut out, output).ok();
+    out.write_all(b"\n").ok();
+    out.flush().ok();
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode_tm;
+
+    #[test]
+    fn parse_pd_game() {
+        let payoff = parse_game("pd").unwrap();
+        assert_eq!(payoff[0], [-1, -1]);  // CC
+        assert_eq!(payoff[1], [-3, 0]);   // CD
+        assert_eq!(payoff[2], [0, -3]);   // DC
+        assert_eq!(payoff[3], [-2, -2]);  // DD
+    }
+
+    #[test]
+    fn parse_chicken_game() {
+        let payoff = parse_game("chicken").unwrap();
+        assert_eq!(payoff[0], [0, 0]);
+        assert_eq!(payoff[1], [-1, 1]);
+        assert_eq!(payoff[2], [1, -1]);
+        assert_eq!(payoff[3], [-10, -10]);
+    }
+
+    #[test]
+    fn parse_custom_game() {
+        let payoff = parse_game("1,2,3,4,5,6,7,8").unwrap();
+        assert_eq!(payoff[0], [1, 2]);
+        assert_eq!(payoff[1], [3, 4]);
+        assert_eq!(payoff[2], [5, 6]);
+        assert_eq!(payoff[3], [7, 8]);
+    }
+
+    #[test]
+    fn parse_custom_game_bad_count() {
+        assert!(parse_game("1,2,3").is_err());
+    }
+
+    #[test]
+    fn parse_custom_game_bad_value() {
+        assert!(parse_game("1,2,3,4,5,6,7,abc").is_err());
+    }
+
+    #[test]
+    fn parse_ids_inline() {
+        let ids = parse_ids(&Some("64,65,192".to_string()), &None).unwrap();
+        assert_eq!(ids, vec![64, 65, 192]);
+    }
+
+    #[test]
+    fn parse_ids_inline_spaces() {
+        let ids = parse_ids(&Some(" 64 , 65 , 192 ".to_string()), &None).unwrap();
+        assert_eq!(ids, vec![64, 65, 192]);
+    }
+
+    #[test]
+    fn parse_ids_missing() {
+        assert!(parse_ids(&None, &None).is_err());
+    }
+
+    #[test]
+    fn all_pairs_count() {
+        assert_eq!(all_pairs(3).len(), 6); // 3 * 2
+        assert_eq!(all_pairs(5).len(), 20); // 5 * 4
+    }
+
+    #[test]
+    fn all_pairs_no_self() {
+        for (i, j) in all_pairs(4) {
+            assert_ne!(i, j);
+        }
+    }
+
+    #[test]
+    fn run_tm_on_tape_empty_tape() {
+        // TM 64 on empty tape should halt (like input 0)
+        let trans = decode_tm(64, 2, 2);
+        let (halted, _out) = run_tm_on_tape(&trans, 2, &[], 500);
+        assert!(halted);
+    }
+
+    #[test]
+    fn run_tm_on_tape_matches_run_tm() {
+        // For small inputs, run_tm_on_tape with the binary digits should
+        // match run_tm with the integer input.
+        let trans = decode_tm(64, 2, 2);
+        for input in 0u64..16 {
+            let (h1, out1, _) = crate::run_tm(&trans, 2, input, 500);
+            let digits = crate::digits_in_base(input, 2);
+            let (h2, out2) = run_tm_on_tape(&trans, 2, &digits, 500);
+            assert_eq!(h1, h2, "halted mismatch for input {}", input);
+            if h1 {
+                assert_eq!(out1, out2, "output mismatch for input {}", input);
+            }
+        }
+    }
+
+    #[test]
+    fn run_tm_on_tape_non_halting() {
+        // TM 0 never halts
+        let trans = decode_tm(0, 2, 2);
+        let (halted, _) = run_tm_on_tape(&trans, 2, &[0, 1], 100);
+        assert!(!halted);
+    }
+
+    #[test]
+    fn play_game_self_cooperator() {
+        // TM 64 always outputs 0 (cooperate). In PD, CC = (-1,-1) each round.
+        // Self vs self for 10 rounds → score = -10 each.
+        let trans = decode_tm(64, 2, 2);
+        let payoff = parse_game("pd").unwrap();
+        let (sa, sb) = play_game_cpu(&trans, &trans, 2, 500, 10, &payoff);
+        assert_eq!(sa, -10);
+        assert_eq!(sb, -10);
+    }
+
+    #[test]
+    fn play_game_cooperator_vs_defector_short() {
+        // TM 64 cooperates. Find a defector TM (always outputs 1).
+        // We'll build one manually: just need a TM where output is always 1.
+        // For now, test that round 0 both cooperate.
+        let trans = decode_tm(64, 2, 2);
+        let payoff = parse_game("pd").unwrap();
+        let (sa, _sb) = play_game_cpu(&trans, &trans, 2, 500, 1, &payoff);
+        // Round 0: both cooperate → CC = (-1, -1)
+        assert_eq!(sa, -1);
+    }
+
+    #[test]
+    fn tournament_small_cpu() {
+        // Run a tiny tournament with 3 known-halting TMs
+        let ids = vec![64, 65, 192];
+        let payoff = parse_game("pd").unwrap();
+        let scores = run_tournament_cpu(&ids, 2, 2, 500, 10, &payoff);
+        assert_eq!(scores.len(), 3);
+        assert_eq!(scores[0].len(), 3);
+        // Diagonal should be 0 (no self-play in pairs)
+        for i in 0..3 {
+            assert_eq!(scores[i][i], 0, "diagonal scores[{}][{}] should be 0", i, i);
+        }
+    }
+
+    #[test]
+    fn tournament_output_ranking_sorted() {
+        let ids = vec![64, 65];
+        let scores = vec![vec![0, -10], vec![-5, 0]];
+        let output = build_output(&ids, scores, 10, "pd", 2, 2);
+        // Ranking should be sorted by total descending
+        assert!(output.ranking[0].total >= output.ranking[1].total);
+    }
+
+    // ── Mixed tournament tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_strategies_inline_basic() {
+        let ndjson = r#"{"type":"tm","id":64,"s":2,"k":2}
+{"type":"fsm","id":0,"s":1,"k":2}
+{"type":"ca","rule":110,"k":2,"r":1.0,"t":10}"#;
+        let specs = parse_strategies_inline(ndjson).unwrap();
+        assert_eq!(specs.len(), 3);
+    }
+
+    #[test]
+    fn parse_strategies_inline_with_comments() {
+        let ndjson = "# comment\n{\"type\":\"tm\",\"id\":64,\"s\":2,\"k\":2}\n\n";
+        let specs = parse_strategies_inline(ndjson).unwrap();
+        assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn parse_strategies_inline_bad_json() {
+        let ndjson = "not json";
+        assert!(parse_strategies_inline(ndjson).is_err());
+    }
+
+    #[test]
+    fn mixed_tournament_tm_only() {
+        // A mixed tournament with only TMs should produce the same results
+        // as the TM-only tournament.
+        let specs = vec![
+            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500 },
+            StrategySpec::Tm { id: 65, s: 2, k: 2, max_steps: 500 },
+        ];
+        let payoff = parse_game("pd").unwrap();
+        let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
+        assert_eq!(survivors.len(), 2); // both TMs halt
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0][0], 0);
+        assert_eq!(scores[1][1], 0);
+    }
+
+    #[test]
+    fn mixed_tournament_fsm_cooperator_vs_defector() {
+        let specs = vec![
+            StrategySpec::Fsm { id: 1, s: 1, k: 2 },
+            StrategySpec::Fsm { id: 0, s: 1, k: 2 },
+        ];
+        let payoff = parse_game("pd").unwrap();
+        let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
+        assert_eq!(survivors.len(), 2); // FSMs always halt
+        assert_eq!(scores[0][1], -30);
+        assert_eq!(scores[1][0], 0);
+    }
+
+    #[test]
+    fn mixed_tournament_three_types() {
+        let specs = vec![
+            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500 },
+            StrategySpec::Fsm { id: 0, s: 1, k: 2 },
+            StrategySpec::Ca { rule: 110, k: 2, r: 1.0, t: 2 },
+        ];
+        let payoff = parse_game("pd").unwrap();
+        let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
+        assert_eq!(survivors.len(), 3); // all halt
+        assert_eq!(scores.len(), 3);
+        for i in 0..3 {
+            assert_eq!(scores[i][i], 0);
+        }
+    }
+
+    #[test]
+    fn mixed_output_ranking_sorted() {
+        let specs = vec![
+            StrategySpec::Fsm { id: 0, s: 1, k: 2 },
+            StrategySpec::Fsm { id: 1, s: 1, k: 2 },
+        ];
+        let scores = vec![vec![0, -30], vec![0, 0]];
+        let output = build_mixed_output(&specs, scores, 10, "pd");
+        assert!(output.ranking[0].total >= output.ranking[1].total);
+    }
+}

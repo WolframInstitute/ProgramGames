@@ -1,0 +1,35 @@
+PacletObject[
+  <|
+    "Name" -> "WolframInstitute/ProgramGames",
+    "Description" -> "Fast iterated game tournaments between Turing machines, finite state machines, and cellular automata",
+    "Creator" -> "Wolfram Institute",
+    "License" -> "MIT",
+    "PublisherID" -> "WolframInstitute",
+    "Version" -> "0.1.0",
+    "WolframVersion" -> "14.0+",
+    "PrimaryContext" -> "WolframInstitute`ProgramGames`",
+    "Extensions" -> {
+      {
+        "Kernel",
+        "Root" -> "Kernel",
+        "Context" -> {"WolframInstitute`ProgramGames`"},
+        "Symbols" -> {
+          "WolframInstitute`ProgramGames`ProgramGamesBinary",
+          "WolframInstitute`ProgramGames`ProgramGamesBuild",
+          "WolframInstitute`ProgramGames`TuringMachineProgramSearch",
+          "WolframInstitute`ProgramGames`TuringMachineClassify",
+          "WolframInstitute`ProgramGames`TuringMachineMaxIndex",
+          "WolframInstitute`ProgramGames`TuringMachineTournament",
+          "WolframInstitute`ProgramGames`CellularAutomatonTournament",
+          "WolframInstitute`ProgramGames`FiniteStateMachineTournament",
+          "WolframInstitute`ProgramGames`ProgramTournament",
+          "WolframInstitute`ProgramGames`SpaceSurveyTable",
+          "WolframInstitute`ProgramGames`ClassificationTable",
+          "WolframInstitute`ProgramGames`ShortNum",
+          "WolframInstitute`ProgramGames`PayoffToString",
+          "WolframInstitute`ProgramGames`StrategyToJSON"
+        }
+      }
+    }
+  |>
+]
