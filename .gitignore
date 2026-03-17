@@ -7,3 +7,6 @@ target/
 # Mathematica
 *.nb.bak
 *.mx
+
+# Vim stuff
+*.sw?
