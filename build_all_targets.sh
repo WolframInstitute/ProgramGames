@@ -5,10 +5,12 @@ set -e
 # Builds release binaries for all supported platforms
 
 # Define targets: WolframSystemID:Rust_target:extra_cargo_flags
-# macOS targets get default features (includes metal); others disable it
+# All targets disable default features (metal) since we cross-compile from Linux
+# and macOS system frameworks (objc, CoreFoundation) aren't available in the sysroot.
+# Metal support is only available when building natively on macOS.
 TARGETS=(
-    "MacOSX-x86-64:x86_64-apple-darwin:"
-    "MacOSX-ARM64:aarch64-apple-darwin:"
+    "MacOSX-x86-64:x86_64-apple-darwin:--no-default-features"
+    "MacOSX-ARM64:aarch64-apple-darwin:--no-default-features"
     "Linux-x86-64:x86_64-unknown-linux-gnu:--no-default-features"
     "Linux-ARM64:aarch64-unknown-linux-gnu:--no-default-features"
     "Windows-x86-64:x86_64-pc-windows-gnu:--no-default-features"
