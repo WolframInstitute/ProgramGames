@@ -872,7 +872,7 @@ fn main() {
             format: _format,
         } => {
             // Parse game payoffs
-            let payoff = match tournament::parse_game(&game) {
+            let dyn_payoff = match tournament::parse_game_dyn(&game) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -919,7 +919,7 @@ fn main() {
                     eprintln!("  [{}] {}", i, spec.label());
                 }
 
-                let (survivors, scores) = tournament::run_mixed_tournament_cpu(&specs, rounds, &payoff);
+                let (survivors, scores) = tournament::run_mixed_tournament_cpu(&specs, rounds, &dyn_payoff);
                 let surviving_specs: Vec<_> = survivors.iter().map(|&i| specs[i].clone()).collect();
                 let output = tournament::build_mixed_output(&surviving_specs, scores, rounds, &game);
 
@@ -967,19 +967,20 @@ fn main() {
                 {
                     if use_gpu {
                         scores = match gpu::run_tournament_gpu(
-                            &tm_ids, states, symbols, max_steps, rounds, &payoff,
+                            &tm_ids, states, symbols, max_steps, rounds,
+                            dyn_payoff.num_actions as u32, &dyn_payoff.entries,
                         ) {
                             Ok(s) => s,
                             Err(e) => {
                                 eprintln!("  GPU tournament failed ({}), falling back to CPU", e);
                                 tournament::run_tournament_cpu(
-                                    &tm_ids, states, symbols, max_steps, rounds, &payoff,
+                                    &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                                 )
                             }
                         };
                     } else {
                         scores = tournament::run_tournament_cpu(
-                            &tm_ids, states, symbols, max_steps, rounds, &payoff,
+                            &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                         );
                     }
                 }
@@ -989,7 +990,7 @@ fn main() {
                         eprintln!("  Metal not compiled in, using CPU");
                     }
                     scores = tournament::run_tournament_cpu(
-                        &tm_ids, states, symbols, max_steps, rounds, &payoff,
+                        &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                     );
                 }
 

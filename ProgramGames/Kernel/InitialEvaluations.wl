@@ -30,6 +30,7 @@ PackageScope["TMTournamentWL"]
 PackageScope["ProgramTournamentWL"]
 PackageScope["TMMaxIndexWL"]
 PackageScope["CAClassifyWL"]
+PackageScope["CATournamentWL"]
 
 
 (* ::Section::Closed:: *)
@@ -55,7 +56,8 @@ $ProgramGamesRequiredFunctionNames = {
 	"tm_tournament_wl",
 	"program_tournament_wl",
 	"tm_max_index_wl",
-	"ca_classify_wl"
+	"ca_classify_wl",
+	"ca_tournament_wl"
 };
 
 iMissingFunctionNames[funcs_Association] :=
@@ -203,3 +205,4 @@ TMTournamentWL := functions["tm_tournament_wl"]
 ProgramTournamentWL := functions["program_tournament_wl"]
 TMMaxIndexWL := functions["tm_max_index_wl"]
 CAClassifyWL := functions["ca_classify_wl"]
+CATournamentWL := functions["ca_tournament_wl"]

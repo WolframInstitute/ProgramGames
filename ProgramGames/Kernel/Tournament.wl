@@ -22,8 +22,8 @@ PackageExport["StrategyToJSON"]
 TuringMachineTournament::usage = "TuringMachineTournament[ids, s, k] runs a GPU-accelerated \
 round-robin tournament among TM ids. Options: \"MaxSteps\", \"Rounds\", \"Game\".";
 
-CellularAutomatonTournament::usage = "CellularAutomatonTournament[rules] runs a tournament \
-among cellular automaton rules. Options: \"Colors\", \"Radius\", \"Steps\", \"Rounds\", \"Game\".";
+CellularAutomatonTournament::usage = "CellularAutomatonTournament[rules] runs a GPU-accelerated \
+tournament among cellular automaton rules. Options: \"Colors\", \"Radius\", \"Steps\", \"Rounds\", \"Game\", \"GPU\".";
 
 FiniteStateMachineTournament::usage = "FiniteStateMachineTournament[ids] runs a tournament \
 among FSM ids. Options: \"States\", \"Colors\", \"Rounds\", \"Game\".";
@@ -72,15 +72,21 @@ StrategyToJSON[{id_Integer, s_Integer, k_Integer}] :=
 
 iParseLabel[label_String] := Which[
 	StringMatchQ[label, "tm(" ~~ __ ~~ ")#" ~~ __],
-		With[{parts = StringCases[label, "tm(" ~~ s__ ~~ "," ~~ k__ ~~ ")#" ~~ id__ :> {"TM", {ToExpression[id], ToExpression[s], ToExpression[k]}}]},
+		With[{parts = StringCases[label,
+			"tm(" ~~ Shortest[s__] ~~ "," ~~ Shortest[k__] ~~ ")#" ~~ id__ :>
+				{"TM", {ToExpression[id], ToExpression[s], ToExpression[k]}}]},
 			If[Length[parts] > 0, First[parts], label]
 		],
 	StringMatchQ[label, "fsm(" ~~ __ ~~ ")#" ~~ __],
-		With[{parts = StringCases[label, "fsm(" ~~ s__ ~~ "," ~~ k__ ~~ ")#" ~~ id__ :> {"FSM", {ToExpression[id], ToExpression[s], ToExpression[k]}}]},
+		With[{parts = StringCases[label,
+			"fsm(" ~~ Shortest[s__] ~~ "," ~~ Shortest[k__] ~~ ")#" ~~ id__ :>
+				{"FSM", {ToExpression[id], ToExpression[s], ToExpression[k]}}]},
 			If[Length[parts] > 0, First[parts], label]
 		],
 	StringMatchQ[label, "ca(" ~~ __ ~~ ")#" ~~ __],
-		With[{parts = StringCases[label, "ca(k=" ~~ k__ ~~ ",r=" ~~ r__ ~~ ",t=" ~~ t__ ~~ ")#" ~~ rule__ :> {"CA", {ToExpression[rule], ToExpression[k], ToExpression[r]}}]},
+		With[{parts = StringCases[label,
+			"ca(" ~~ Shortest[k__] ~~ "," ~~ Shortest[r__] ~~ "," ~~ Shortest[t__] ~~ ")#" ~~ rule__ :>
+				{"CA", {ToExpression[rule], ToExpression[k], Rationalize[ToExpression[r]]}}]},
 			If[Length[parts] > 0, First[parts], label]
 		],
 	True, label
@@ -166,14 +172,33 @@ ProgramTournament[strategies_List, opts : OptionsPattern[]] :=
 
 Options[CellularAutomatonTournament] = {
 	"Colors" -> 2, "Radius" -> 1, "Steps" -> 10,
-	"Rounds" -> 100, "Game" -> "pd"
+	"Rounds" -> 100, "Game" -> "pd", "GPU" -> True
 };
 
 CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
-	ProgramTournament[
-		{"CA", #, OptionValue["Colors"], OptionValue["Radius"], OptionValue["Steps"]} & /@ caRules,
-		"Rounds" -> OptionValue["Rounds"],
-		"Game" -> OptionValue["Game"]
+	Module[{k, r, rNum, rDen, gameStr, resultJSON, result},
+		k = OptionValue["Colors"];
+		r = OptionValue["Radius"];
+		{rNum, rDen} = If[IntegerQ[r], {r, 1}, Through[{Numerator, Denominator}[r]]];
+		gameStr = PayoffToString[OptionValue["Game"]];
+		resultJSON = CATournamentWL[k, rNum, rDen,
+			OptionValue["Steps"], OptionValue["Rounds"],
+			gameStr, ExportString[caRules, "RawJSON"],
+			TrueQ[OptionValue["GPU"]]];
+		If[FailureQ[resultJSON], Return[$Failed]];
+		result = ImportString[resultJSON, "RawJSON"];
+		<|
+			"Strategies" -> (iParseLabel /@ result["strategies"]),
+			"Labels" -> (iParseLabel /@ Lookup[result["ranking"], "label"]),
+			"Scores" -> result["scores"],
+			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b", iParseLabel],
+			"Ranking" -> Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]],
+			"Rounds" -> result["rounds"],
+			"Game" -> result["game"],
+			"NumStrategies" -> result["num_strategies"],
+			"NumPairs" -> result["num_pairs"],
+			"GPU" -> TrueQ[result["gpu"]]
+		|>
 	]
 
 

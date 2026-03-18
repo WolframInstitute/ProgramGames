@@ -5,13 +5,17 @@
 
 use serde::Deserialize;
 
-use crate::tournament::{run_tm_on_tape, Payoff};
+use crate::tournament::{run_tm_on_tape, DynPayoff, Payoff};
 use crate::TmTransition;
 
 // ── Strategy specification (JSON-deserializable) ─────────────────────────────
 
 fn default_max_steps() -> u32 {
     500
+}
+
+fn default_num_actions() -> u8 {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,11 +28,26 @@ pub enum StrategySpec {
         k: u8,
         #[serde(default = "default_max_steps")]
         max_steps: u32,
+        #[serde(default = "default_num_actions")]
+        num_actions: u8,
     },
     #[serde(rename = "fsm")]
-    Fsm { id: u64, s: u16, k: u8 },
+    Fsm {
+        id: u64,
+        s: u16,
+        k: u8,
+        #[serde(default = "default_num_actions")]
+        num_actions: u8,
+    },
     #[serde(rename = "ca")]
-    Ca { rule: u64, k: u8, r: f32, t: u32 },
+    Ca {
+        rule: u64,
+        k: u8,
+        r: f32,
+        t: u32,
+        #[serde(default = "default_num_actions")]
+        num_actions: u8,
+    },
 }
 
 impl StrategySpec {
@@ -36,8 +55,8 @@ impl StrategySpec {
     pub fn label(&self) -> String {
         match self {
             StrategySpec::Tm { id, s, k, .. } => format!("tm({},{})#{}", s, k, id),
-            StrategySpec::Fsm { id, s, k } => format!("fsm({},{})#{}", s, k, id),
-            StrategySpec::Ca { rule, k, r, t } => format!("ca({},{},{})#{}", k, r, t, rule),
+            StrategySpec::Fsm { id, s, k, .. } => format!("fsm({},{})#{}", s, k, id),
+            StrategySpec::Ca { rule, k, r, t, .. } => format!("ca({},{},{})#{}", k, r, t, rule),
         }
     }
 }
@@ -56,20 +75,23 @@ enum RunnerInner {
         transitions: Vec<TmTransition>,
         symbols: u8,
         max_steps: u32,
+        num_actions: u8,
     },
     Fsm {
         state: usize,
-        /// outputs[state] = output symbol (0 or 1)
+        /// outputs[state] = output symbol
         outputs: Vec<u8>,
         /// transitions[state * k + input] = next_state (0-indexed)
         transitions: Vec<usize>,
         k: usize,
+        num_actions: u8,
     },
     Ca {
         rule_table: Vec<u8>,
         k: u8,
         two_r: u32,
         t: u32,
+        num_actions: u8,
     },
 }
 
@@ -82,15 +104,17 @@ impl StrategyRunner {
                 s,
                 k,
                 max_steps,
+                num_actions,
             } => {
                 let transitions = crate::decode_tm(*id, *s, *k);
                 RunnerInner::Tm {
                     transitions,
                     symbols: *k,
                     max_steps: *max_steps,
+                    num_actions: *num_actions,
                 }
             }
-            StrategySpec::Fsm { id, s, k } => {
+            StrategySpec::Fsm { id, s, k, num_actions } => {
                 let (outputs, transitions) =
                     decode_fsm(*id, *s as usize, *k as usize);
                 RunnerInner::Fsm {
@@ -98,9 +122,10 @@ impl StrategyRunner {
                     outputs,
                     transitions,
                     k: *k as usize,
+                    num_actions: *num_actions,
                 }
             }
-            StrategySpec::Ca { rule, k, r, t } => {
+            StrategySpec::Ca { rule, k, r, t, num_actions } => {
                 let two_r = (2.0 * r).round() as u32;
                 let rule_table = decode_ca_rule_table(*rule, *k, two_r);
                 RunnerInner::Ca {
@@ -108,6 +133,7 @@ impl StrategyRunner {
                     k: *k,
                     two_r,
                     t: *t,
+                    num_actions: *num_actions,
                 }
             }
         };
@@ -133,6 +159,7 @@ impl StrategyRunner {
                 transitions,
                 symbols,
                 max_steps,
+                num_actions,
             } => {
                 if round == 0 {
                     return Some(0); // cooperate on empty history
@@ -140,7 +167,7 @@ impl StrategyRunner {
                 let (halted, output) =
                     run_tm_on_tape(transitions, *symbols, history, *max_steps);
                 if halted {
-                    Some(output % 2)
+                    Some(output % *num_actions)
                 } else {
                     None // non-halting: caller must exclude this TM
                 }
@@ -150,6 +177,7 @@ impl StrategyRunner {
                 outputs,
                 transitions,
                 k,
+                num_actions,
             } => {
                 // On round 0: output based on initial state, input defaults to 0
                 let input = if round == 0 {
@@ -180,7 +208,7 @@ impl StrategyRunner {
                     history.last().copied().unwrap_or(0) as usize
                 };
 
-                let output = outputs.get(*state).copied().unwrap_or(0);
+                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
 
                 // Transition
                 let idx = (*state) * (*k) + input.min(*k - 1);
@@ -193,11 +221,12 @@ impl StrategyRunner {
                 k,
                 two_r,
                 t,
+                num_actions,
             } => {
                 if round == 0 {
                     return Some(0); // cooperate on empty history
                 }
-                Some(ca_move(rule_table, *k, *two_r, *t, history))
+                Some(ca_move(rule_table, *k, *two_r, *t, history, *num_actions))
             }
         }
     }
@@ -212,6 +241,7 @@ impl StrategyRunner {
                 outputs,
                 transitions,
                 k,
+                num_actions,
             } => {
                 let input = if round == 0 {
                     0usize
@@ -219,7 +249,7 @@ impl StrategyRunner {
                     opponent_last as usize
                 };
 
-                let output = outputs.get(*state).copied().unwrap_or(0);
+                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
 
                 let idx = (*state) * (*k) + input.min(*k - 1);
                 *state = transitions.get(idx).copied().unwrap_or(0);
@@ -385,7 +415,7 @@ pub fn run_shrinking_ca(
 /// Compute a CA strategy's move from the game history bits.
 /// Runs ShrinkingCA for `t` steps on the history, returns the last cell of the
 /// final row (mod 2 for binary output).
-pub fn ca_move(rule_table: &[u8], k: u8, two_r: u32, t: u32, history_bits: &[u8]) -> u8 {
+pub fn ca_move(rule_table: &[u8], k: u8, two_r: u32, t: u32, history_bits: &[u8], num_actions: u8) -> u8 {
     if history_bits.is_empty() {
         return 0;
     }
@@ -394,7 +424,7 @@ pub fn ca_move(rule_table: &[u8], k: u8, two_r: u32, t: u32, history_bits: &[u8]
     if last_row.is_empty() {
         0
     } else {
-        last_row[last_row.len() - 1] % 2
+        last_row[last_row.len() - 1] % num_actions
     }
 }
 
@@ -480,6 +510,45 @@ pub fn play_game(
         history.push(move_b);
 
         let idx = (move_a as usize) * 2 + move_b as usize;
+        if let Some(payoffs) = payoff.get(idx) {
+            score_a += payoffs[0] as i64;
+            score_b += payoffs[1] as i64;
+        }
+    }
+
+    (Some((score_a, score_b)), 0)
+}
+
+/// Play an iterated game between two strategy runners using a DynPayoff (k-action games).
+/// Returns `Some((score_a, score_b))` if both players halt every round,
+/// or `None` if either player fails to halt (the game is aborted).
+/// The `failed` output indicates which player(s) failed: 0=none, 1=a, 2=b, 3=both.
+pub fn play_game_dyn(
+    runner_a: &mut StrategyRunner,
+    runner_b: &mut StrategyRunner,
+    rounds: u32,
+    payoff: &DynPayoff,
+) -> (Option<(i64, i64)>, u8) {
+    runner_a.reset();
+    runner_b.reset();
+    let mut history: Vec<u8> = Vec::with_capacity(2 * rounds as usize);
+    let mut score_a = 0i64;
+    let mut score_b = 0i64;
+
+    for round in 0..rounds {
+        let move_a = match runner_a.get_move(&history, round) {
+            Some(m) => m,
+            None => return (None, 1), // player A failed to halt
+        };
+        let move_b = match runner_b.get_move(&history, round) {
+            Some(m) => m,
+            None => return (None, 2), // player B failed to halt
+        };
+
+        history.push(move_a);
+        history.push(move_b);
+
+        let idx = (move_a as usize) * payoff.num_actions + move_b as usize;
         if let Some(payoffs) = payoff.get(idx) {
             score_a += payoffs[0] as i64;
             score_b += payoffs[1] as i64;
@@ -576,7 +645,7 @@ mod tests {
 
     #[test]
     fn fsm_runner_cooperates_on_round_0() {
-        let spec = StrategySpec::Fsm { id: 0, s: 2, k: 2 };
+        let spec = StrategySpec::Fsm { id: 0, s: 2, k: 2, num_actions: 2 };
         let mut runner = StrategyRunner::new(&spec);
         let m = runner.get_move(&[], 0).unwrap();
         // FSM outputs based on initial state; the exact value depends on the FSM
@@ -586,7 +655,7 @@ mod tests {
     #[test]
     fn fsm_runner_stateful_across_rounds() {
         // Create an FSM and verify it can change state
-        let spec = StrategySpec::Fsm { id: 47, s: 2, k: 2 };
+        let spec = StrategySpec::Fsm { id: 47, s: 2, k: 2, num_actions: 2 };
         let mut runner = StrategyRunner::new(&spec);
         let m0 = runner.get_move(&[], 0).unwrap();
         let m1 = runner.get_move(&[m0, 1], 1).unwrap();
@@ -596,7 +665,7 @@ mod tests {
 
     #[test]
     fn fsm_runner_reset_restores_state() {
-        let spec = StrategySpec::Fsm { id: 47, s: 2, k: 2 };
+        let spec = StrategySpec::Fsm { id: 47, s: 2, k: 2, num_actions: 2 };
         let mut runner = StrategyRunner::new(&spec);
         let m0 = runner.get_move(&[], 0).unwrap();
         let _ = runner.get_move(&[m0, 1], 1).unwrap();
@@ -666,14 +735,14 @@ mod tests {
     #[test]
     fn ca_move_empty_history() {
         let table = decode_ca_rule_table(110, 2, 2);
-        assert_eq!(ca_move(&table, 2, 2, 10, &[]), 0);
+        assert_eq!(ca_move(&table, 2, 2, 10, &[], 2), 0);
     }
 
     #[test]
     fn ca_move_returns_valid_output() {
         let table = decode_ca_rule_table(110, 2, 2);
         let history = vec![0, 1, 1, 0, 0, 1];
-        let m = ca_move(&table, 2, 2, 2, &history);
+        let m = ca_move(&table, 2, 2, 2, &history, 2);
         assert!(m < 2);
     }
 
@@ -684,6 +753,7 @@ mod tests {
             k: 2,
             r: 1.0,
             t: 10,
+            num_actions: 2,
         };
         let mut runner = StrategyRunner::new(&spec);
         assert_eq!(runner.get_move(&[], 0), Some(0));
@@ -696,6 +766,7 @@ mod tests {
             k: 2,
             r: 1.0,
             t: 2,
+            num_actions: 2,
         };
         let mut runner = StrategyRunner::new(&spec);
         let m0 = runner.get_move(&[], 0).unwrap();
@@ -715,6 +786,7 @@ mod tests {
             s: 2,
             k: 2,
             max_steps: 500,
+            num_actions: 2,
         };
         let mut runner = StrategyRunner::new(&spec);
         assert_eq!(runner.get_move(&[], 0), Some(0));
@@ -728,6 +800,7 @@ mod tests {
             s: 2,
             k: 2,
             max_steps: 500,
+            num_actions: 2,
         };
         let mut runner = StrategyRunner::new(&spec);
         assert_eq!(runner.get_move(&[], 0), Some(0));
@@ -744,12 +817,14 @@ mod tests {
             s: 2,
             k: 2,
             max_steps: 500,
+            num_actions: 2,
         };
         let spec_b = StrategySpec::Tm {
             id: 64,
             s: 2,
             k: 2,
             max_steps: 500,
+            num_actions: 2,
         };
         let mut runner_a = StrategyRunner::new(&spec_a);
         let mut runner_b = StrategyRunner::new(&spec_b);
@@ -763,8 +838,8 @@ mod tests {
 
     #[test]
     fn play_game_fsm_vs_fsm() {
-        let spec_a = StrategySpec::Fsm { id: 1, s: 1, k: 2 };
-        let spec_b = StrategySpec::Fsm { id: 0, s: 1, k: 2 };
+        let spec_a = StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 };
+        let spec_b = StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 };
         let mut runner_a = StrategyRunner::new(&spec_a);
         let mut runner_b = StrategyRunner::new(&spec_b);
         let payoff = crate::tournament::parse_game("pd").unwrap();
@@ -782,8 +857,9 @@ mod tests {
             s: 2,
             k: 2,
             max_steps: 500,
+            num_actions: 2,
         };
-        let spec_b = StrategySpec::Fsm { id: 0, s: 1, k: 2 };
+        let spec_b = StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 };
         let mut runner_a = StrategyRunner::new(&spec_a);
         let mut runner_b = StrategyRunner::new(&spec_b);
         let payoff = crate::tournament::parse_game("pd").unwrap();
@@ -801,11 +877,12 @@ mod tests {
         let json = r#"{"type":"tm","id":323,"s":2,"k":2}"#;
         let spec: StrategySpec = serde_json::from_str(json).unwrap();
         match spec {
-            StrategySpec::Tm { id, s, k, max_steps } => {
+            StrategySpec::Tm { id, s, k, max_steps, num_actions } => {
                 assert_eq!(id, 323);
                 assert_eq!(s, 2);
                 assert_eq!(k, 2);
                 assert_eq!(max_steps, 500); // default
+                assert_eq!(num_actions, 2); // default
             }
             _ => panic!("expected Tm"),
         }
@@ -826,10 +903,11 @@ mod tests {
         let json = r#"{"type":"fsm","id":47,"s":2,"k":2}"#;
         let spec: StrategySpec = serde_json::from_str(json).unwrap();
         match spec {
-            StrategySpec::Fsm { id, s, k } => {
+            StrategySpec::Fsm { id, s, k, num_actions } => {
                 assert_eq!(id, 47);
                 assert_eq!(s, 2);
                 assert_eq!(k, 2);
+                assert_eq!(num_actions, 2); // default
             }
             _ => panic!("expected Fsm"),
         }
@@ -840,11 +918,12 @@ mod tests {
         let json = r#"{"type":"ca","rule":110,"k":2,"r":1.0,"t":10}"#;
         let spec: StrategySpec = serde_json::from_str(json).unwrap();
         match spec {
-            StrategySpec::Ca { rule, k, r, t } => {
+            StrategySpec::Ca { rule, k, r, t, num_actions } => {
                 assert_eq!(rule, 110);
                 assert_eq!(k, 2);
                 assert!((r - 1.0).abs() < f32::EPSILON);
                 assert_eq!(t, 10);
+                assert_eq!(num_actions, 2); // default
             }
             _ => panic!("expected Ca"),
         }

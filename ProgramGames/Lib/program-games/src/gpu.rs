@@ -43,8 +43,8 @@ mod metal_impl {
         symbols: u32,
         max_steps: u32,
         rounds: u32,
-        _pad: u32,
-        payoff: [i32; 8], // CC_a, CC_b, CD_a, CD_b, DC_a, DC_b, DD_a, DD_b
+        num_actions: u32,
+        _pad: [u32; 2],
     }
 
     const SHADER_SOURCE: &str = r#"
@@ -175,11 +175,11 @@ struct GameParams {
     uint symbols;
     uint max_steps;
     uint rounds;
-    uint _pad;
-    int payoff[8];  // CC_a, CC_b, CD_a, CD_b, DC_a, DC_b, DD_a, DD_b
+    uint num_actions;
+    uint _pad[2];
 };
 
-// Run a TM on history bits as tape. Returns move (output_symbol % 2),
+// Run a TM on history bits as tape. Returns move (output_symbol % num_actions),
 // or 1 (defect) on timeout/non-halt.
 // Tape layout: [0 0 ... 0 | history[0] ... history[hist_len-1]]
 //               ^left_pad
@@ -190,7 +190,8 @@ uint run_tm_inline(
     uint k,
     thread uchar* history,
     uint hist_len,
-    uint max_steps)
+    uint max_steps,
+    uint num_actions)
 {
     // Allocate tape with left padding in thread-local memory
     // Max tape size: max_steps + 1 (left pad) + hist_len
@@ -226,8 +227,8 @@ uint run_tm_inline(
 
         if (t.move_right != 0u) {
             if (head + 1 == tape_len) {
-                // Halted: return output mod 2
-                return tape[tape_len - 1] % 2;
+                // Halted: return output mod num_actions
+                return tape[tape_len - 1] % num_actions;
             }
             head++;
         } else {
@@ -251,6 +252,7 @@ kernel void tm_tournament(
     device const uint2* pairs                   [[buffer(1)]],
     device int2* scores                         [[buffer(2)]],
     constant GameParams& params                 [[buffer(3)]],
+    device const int* payoff                    [[buffer(4)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= params.num_pairs) return;
@@ -258,6 +260,7 @@ kernel void tm_tournament(
     uint a_idx = pairs[gid].x;
     uint b_idx = pairs[gid].y;
     uint k = params.symbols;
+    uint na = params.num_actions;
     uint trans_per_tm = params.states * k;
 
     device const GpuTransition* trans_a = all_transitions + a_idx * trans_per_tm;
@@ -278,8 +281,8 @@ kernel void tm_tournament(
             move_a = 0;
             move_b = 0; // cooperate on empty history
         } else {
-            move_a = run_tm_inline(trans_a, k, history, hist_len, params.max_steps);
-            move_b = run_tm_inline(trans_b, k, history, hist_len, params.max_steps);
+            move_a = run_tm_inline(trans_a, k, history, hist_len, params.max_steps, na);
+            move_b = run_tm_inline(trans_b, k, history, hist_len, params.max_steps, na);
         }
 
         // Append moves to history
@@ -290,10 +293,10 @@ kernel void tm_tournament(
             history[hist_len++] = (uchar)move_b;
         }
 
-        // Score: idx = move_a * 2 + move_b
-        uint idx = move_a * 2 + move_b;
-        score_a += params.payoff[idx * 2];
-        score_b += params.payoff[idx * 2 + 1];
+        // Score: idx = move_a * na + move_b
+        uint idx = move_a * na + move_b;
+        score_a += payoff[idx * 2];
+        score_b += payoff[idx * 2 + 1];
     }
 
     scores[gid] = int2(score_a, score_b);
@@ -310,7 +313,6 @@ kernel void tm_tournament(
         pub fn new() -> Result<Self, String> {
             let device =
                 Device::system_default().ok_or("Metal device unavailable")?;
-            eprintln!("  Metal device: {}", device.name());
             let options = CompileOptions::new();
             let library = device
                 .new_library_with_source(SHADER_SOURCE, &options)
@@ -453,7 +455,6 @@ kernel void tm_tournament(
         pub fn new() -> Result<Self, String> {
             let device =
                 Device::system_default().ok_or("Metal device unavailable")?;
-            eprintln!("  Metal device: {}", device.name());
             let options = CompileOptions::new();
             let library = device
                 .new_library_with_source(TOURNAMENT_SHADER_SOURCE, &options)
@@ -480,7 +481,8 @@ kernel void tm_tournament(
             symbols: u8,
             max_steps: u32,
             rounds: u32,
-            payoff: &[[i32; 2]; 4],
+            num_actions: u32,
+            payoff_entries: &[[i32; 2]],
         ) -> Result<Vec<Vec<i64>>, String> {
             let n = ids.len();
             if n == 0 {
@@ -517,17 +519,11 @@ kernel void tm_tournament(
             }
             let num_pairs = pairs.len();
 
-            eprintln!(
-                "  GPU tournament: {} machines, {} pairs, {} rounds",
-                n, num_pairs, rounds
-            );
-
-            // Flatten payoff into 8 i32s: CC_a, CC_b, CD_a, CD_b, DC_a, DC_b, DD_a, DD_b
-            let mut payoff_flat = [0i32; 8];
-            for (idx, &[a, b]) in payoff.iter().enumerate() {
-                payoff_flat[idx * 2] = a;
-                payoff_flat[idx * 2 + 1] = b;
-            }
+            // Flatten payoff entries into interleaved [score_a, score_b, ...] for GPU
+            let payoff_flat: Vec<i32> = payoff_entries
+                .iter()
+                .flat_map(|&[a, b]| vec![a, b])
+                .collect();
 
             let params = GameParams {
                 num_pairs: num_pairs as u32,
@@ -535,13 +531,14 @@ kernel void tm_tournament(
                 symbols: symbols as u32,
                 max_steps,
                 rounds,
-                _pad: 0,
-                payoff: payoff_flat,
+                num_actions,
+                _pad: [0; 2],
             };
 
             // Create buffers
             let trans_buf = self.buf_from_slice(&gpu_trans);
             let pairs_buf = self.buf_from_slice(&pairs);
+            let payoff_buf = self.buf_from_slice(&payoff_flat);
             // scores: one int2 per pair
             let scores_buf = self.device.new_buffer(
                 (num_pairs.max(1) * size_of::<[i32; 2]>()) as u64,
@@ -568,6 +565,7 @@ kernel void tm_tournament(
                 size_of::<GameParams>() as u64,
                 (&params as *const GameParams).cast(),
             );
+            encoder.set_buffer(4, Some(&payoff_buf), 0);
 
             let width = self.pipeline.thread_execution_width().max(1);
             let threads_per_group = MTLSize::new(width, 1, 1);
@@ -596,6 +594,288 @@ kernel void tm_tournament(
                         // raw_scores[pair_idx][1] is j's score against i
                         pair_idx += 1;
                     }
+                }
+            }
+
+            Ok(matrix)
+        }
+
+        fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
+            if slice.is_empty() {
+                return self.device.new_buffer(
+                    4,
+                    MTLResourceOptions::StorageModeShared,
+                );
+            }
+            let len = (slice.len() * size_of::<T>()) as u64;
+            self.device.new_buffer_with_data(
+                slice.as_ptr() as *const c_void,
+                len,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+    }
+
+    // ── CA Tournament on Metal ─────────────────────────────────────────
+
+    const CA_TOURNAMENT_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CaGameParams {
+    uint num_pairs;
+    uint k;
+    uint two_r;
+    uint t;          // CA evolution steps
+    uint rounds;
+    uint num_actions;
+    uint table_len;
+    uint _pad;
+};
+
+// Run shrinking CA on history, return last cell % num_actions.
+// Uses thread-local arrays for the row computation.
+uint run_ca_inline(
+    device const uchar* rule_table,
+    uint k,
+    uint two_r,
+    uint t_steps,
+    thread uchar* history,
+    uint hist_len,
+    uint num_actions)
+{
+    if (hist_len == 0) return 0;
+
+    const uint MAX_ROW = 512;
+    uchar row[MAX_ROW];
+    uint row_len = min(hist_len, MAX_ROW);
+
+    for (uint i = 0; i < row_len; i++) {
+        row[i] = history[i];
+    }
+
+    uint neighborhood = two_r + 1;
+
+    for (uint step = 0; step < t_steps; step++) {
+        if (row_len <= two_r) break;
+        uint next_len = row_len - two_r;
+        if (next_len == 0) break;
+
+        uchar next_row[MAX_ROW];
+        for (uint pos = 0; pos < next_len; pos++) {
+            uint idx = 0;
+            for (uint n = 0; n < neighborhood; n++) {
+                idx = idx * k + row[pos + n];
+            }
+            next_row[pos] = rule_table[idx];
+        }
+
+        for (uint i = 0; i < next_len; i++) {
+            row[i] = next_row[i];
+        }
+        row_len = next_len;
+    }
+
+    return row[row_len - 1] % num_actions;
+}
+
+kernel void ca_tournament(
+    device const uchar* all_rule_tables [[buffer(0)]],
+    device const uint2* pairs           [[buffer(1)]],
+    device int2* scores                 [[buffer(2)]],
+    constant CaGameParams& params       [[buffer(3)]],
+    device const int* payoff            [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.num_pairs) return;
+
+    uint a_idx = pairs[gid].x;
+    uint b_idx = pairs[gid].y;
+
+    device const uchar* table_a = all_rule_tables + a_idx * params.table_len;
+    device const uchar* table_b = all_rule_tables + b_idx * params.table_len;
+
+    uint na = params.num_actions;
+
+    uchar history[1024];
+    uint hist_len = 0;
+    int score_a = 0;
+    int score_b = 0;
+
+    for (uint round = 0; round < params.rounds; round++) {
+        uint move_a, move_b;
+
+        if (round == 0) {
+            move_a = 0;
+            move_b = 0;
+        } else {
+            move_a = run_ca_inline(table_a, params.k, params.two_r, params.t, history, hist_len, na);
+            move_b = run_ca_inline(table_b, params.k, params.two_r, params.t, history, hist_len, na);
+        }
+
+        if (hist_len < 1024) { history[hist_len++] = (uchar)move_a; }
+        if (hist_len < 1024) { history[hist_len++] = (uchar)move_b; }
+
+        uint idx = move_a * na + move_b;
+        score_a += payoff[idx * 2];
+        score_b += payoff[idx * 2 + 1];
+    }
+
+    scores[gid] = int2(score_a, score_b);
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CaGameParams {
+        num_pairs: u32,
+        k: u32,
+        two_r: u32,
+        t: u32,
+        rounds: u32,
+        num_actions: u32,
+        table_len: u32,
+        _pad: u32,
+    }
+
+    pub struct MetalCaTournament {
+        device: Device,
+        queue: CommandQueue,
+        pipeline: ComputePipelineState,
+    }
+
+    impl MetalCaTournament {
+        pub fn new() -> Result<Self, String> {
+            let device =
+                Device::system_default().ok_or("Metal device unavailable")?;
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(CA_TOURNAMENT_SHADER, &options)
+                .map_err(|e| format!("Metal CA tournament shader compile: {e}"))?;
+            let func = library
+                .get_function("ca_tournament", None)
+                .map_err(|e| format!("Metal CA tournament function: {e}"))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("Metal CA tournament pipeline: {e}"))?;
+            let queue = device.new_command_queue();
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+            })
+        }
+
+        pub fn run_tournament(
+            &self,
+            rule_ids: &[u64],
+            k: u8,
+            two_r: u32,
+            t: u32,
+            rounds: u32,
+            num_actions: u32,
+            payoff_entries: &[[i32; 2]],
+        ) -> Result<Vec<Vec<i64>>, String> {
+            let n = rule_ids.len();
+            if n == 0 {
+                return Ok(vec![]);
+            }
+
+            let table_len = (k as u32).pow(two_r + 1) as usize;
+
+            // Decode all rule tables on CPU
+            let flat_tables: Vec<u8> = rule_ids
+                .iter()
+                .flat_map(|&rule| {
+                    super::super::strategy::decode_ca_rule_table(rule, k, two_r)
+                })
+                .collect();
+
+            // Build all ordered pairs (i, j) where i != j
+            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * (n - 1));
+            for i in 0..n {
+                for j in 0..n {
+                    if i != j {
+                        all_pairs.push([i as u32, j as u32]);
+                    }
+                }
+            }
+
+            // Flatten payoff entries into interleaved [score_a, score_b, ...] for GPU
+            let payoff_flat: Vec<i32> = payoff_entries
+                .iter()
+                .flat_map(|&[a, b]| vec![a, b])
+                .collect();
+
+            // Upload rule tables and payoff once (shared across all batches)
+            let tables_buf = self.buf_from_slice(&flat_tables);
+            let payoff_buf = self.buf_from_slice(&payoff_flat);
+
+            // Process pairs in batches to limit GPU memory usage
+            const BATCH_SIZE: usize = 5_000_000;
+            let mut matrix = vec![vec![0i64; n]; n];
+
+            for (batch_idx, batch) in all_pairs.chunks(BATCH_SIZE).enumerate() {
+                let batch_len = batch.len();
+                let params = CaGameParams {
+                    num_pairs: batch_len as u32,
+                    k: k as u32,
+                    two_r,
+                    t,
+                    rounds,
+                    num_actions,
+                    table_len: table_len as u32,
+                    _pad: 0,
+                };
+
+                let pairs_buf = self.buf_from_slice(batch);
+                let scores_buf = self.device.new_buffer(
+                    (batch_len.max(1) * size_of::<[i32; 2]>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                unsafe {
+                    std::ptr::write_bytes(
+                        scores_buf.contents() as *mut u8,
+                        0,
+                        batch_len * size_of::<[i32; 2]>(),
+                    );
+                }
+
+                let cmd_buf = self.queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.pipeline);
+                encoder.set_buffer(0, Some(&tables_buf), 0);
+                encoder.set_buffer(1, Some(&pairs_buf), 0);
+                encoder.set_buffer(2, Some(&scores_buf), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of::<CaGameParams>() as u64,
+                    (&params as *const CaGameParams).cast(),
+                );
+                encoder.set_buffer(4, Some(&payoff_buf), 0);
+
+                let width = self.pipeline.thread_execution_width().max(1);
+                let threads_per_group = MTLSize::new(width, 1, 1);
+                let groups = MTLSize::new(
+                    (batch_len as u64 + width - 1) / width,
+                    1,
+                    1,
+                );
+                encoder.dispatch_thread_groups(groups, threads_per_group);
+                encoder.end_encoding();
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
+
+                // Read batch results into score matrix
+                let raw_scores = unsafe {
+                    let ptr = scores_buf.contents() as *const [i32; 2];
+                    std::slice::from_raw_parts(ptr, batch_len)
+                };
+
+                let batch_start = batch_idx * BATCH_SIZE;
+                for (local_idx, score) in raw_scores.iter().enumerate() {
+                    let pair = all_pairs[batch_start + local_idx];
+                    matrix[pair[0] as usize][pair[1] as usize] = score[0] as i64;
                 }
             }
 
@@ -739,7 +1019,6 @@ kernel void ca_classify(
         pub fn new() -> Result<Self, String> {
             let device =
                 Device::system_default().ok_or("Metal device unavailable")?;
-            eprintln!("  Metal CA classify on: {}", device.name());
             let options = CompileOptions::new();
             let library = device
                 .new_library_with_source(CA_CLASSIFY_SHADER, &options)
@@ -774,11 +1053,6 @@ kernel void ca_classify(
             if buf_bytes == 0 {
                 return Ok((vec![], sig_len as usize));
             }
-
-            eprintln!(
-                "  GPU CA classify: {} rules, sig_len={}, table_len={}, buf={}KB",
-                total_rules, sig_len, table_len, buf_bytes / 1024
-            );
 
             let params = CaClassifyParams {
                 total_rules,
@@ -842,10 +1116,11 @@ pub fn run_tournament_gpu(
     symbols: u8,
     max_steps: u32,
     rounds: u32,
-    payoff: &[[i32; 2]; 4],
+    num_actions: u32,
+    payoff_entries: &[[i32; 2]],
 ) -> Result<Vec<Vec<i64>>, String> {
     let gpu = metal_impl::MetalTournament::new()?;
-    gpu.run_tournament(ids, states, symbols, max_steps, rounds, payoff)
+    gpu.run_tournament(ids, states, symbols, max_steps, rounds, num_actions, payoff_entries)
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -855,7 +1130,36 @@ pub fn run_tournament_gpu(
     _symbols: u8,
     _max_steps: u32,
     _rounds: u32,
-    _payoff: &[[i32; 2]; 4],
+    _num_actions: u32,
+    _payoff_entries: &[[i32; 2]],
+) -> Result<Vec<Vec<i64>>, String> {
+    Err("Metal not available".to_string())
+}
+
+/// Run a CA tournament on GPU. Returns score_matrix[i][j].
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn run_ca_tournament_gpu(
+    rule_ids: &[u64],
+    k: u8,
+    two_r: u32,
+    t: u32,
+    rounds: u32,
+    num_actions: u32,
+    payoff_entries: &[[i32; 2]],
+) -> Result<Vec<Vec<i64>>, String> {
+    let gpu = metal_impl::MetalCaTournament::new()?;
+    gpu.run_tournament(rule_ids, k, two_r, t, rounds, num_actions, payoff_entries)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn run_ca_tournament_gpu(
+    _rule_ids: &[u64],
+    _k: u8,
+    _two_r: u32,
+    _t: u32,
+    _rounds: u32,
+    _num_actions: u32,
+    _payoff_entries: &[[i32; 2]],
 ) -> Result<Vec<Vec<i64>>, String> {
     Err("Metal not available".to_string())
 }

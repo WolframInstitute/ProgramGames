@@ -619,7 +619,7 @@ pub fn tm_tournament_wl(
     let max_steps = max_steps as u32;
     let rounds = rounds as u32;
 
-    let payoff = match tournament::parse_game(&game) {
+    let dyn_payoff = match tournament::parse_game_dyn(&game) {
         Ok(p) => p,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e),
     };
@@ -638,18 +638,19 @@ pub fn tm_tournament_wl(
     {
         if use_gpu {
             scores = match gpu::run_tournament_gpu(
-                &ids, states, symbols, max_steps, rounds, &payoff,
+                &ids, states, symbols, max_steps, rounds,
+                dyn_payoff.num_actions as u32, &dyn_payoff.entries,
             ) {
                 Ok(s) => s,
                 Err(_e) => {
                     tournament::run_tournament_cpu(
-                        &ids, states, symbols, max_steps, rounds, &payoff,
+                        &ids, states, symbols, max_steps, rounds, &dyn_payoff,
                     )
                 }
             };
         } else {
             scores = tournament::run_tournament_cpu(
-                &ids, states, symbols, max_steps, rounds, &payoff,
+                &ids, states, symbols, max_steps, rounds, &dyn_payoff,
             );
         }
     }
@@ -657,7 +658,7 @@ pub fn tm_tournament_wl(
     {
         let _ = use_gpu;
         scores = tournament::run_tournament_cpu(
-            &ids, states, symbols, max_steps, rounds, &payoff,
+            &ids, states, symbols, max_steps, rounds, &dyn_payoff,
         );
     }
 
@@ -675,7 +676,7 @@ pub fn program_tournament_wl(
 ) -> String {
     let rounds = rounds as u32;
 
-    let payoff = match tournament::parse_game(&game) {
+    let payoff = match tournament::parse_game_dyn(&game) {
         Ok(p) => p,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e),
     };
@@ -703,6 +704,126 @@ pub fn tm_max_index_wl(states: i64, symbols: i64) -> i64 {
         Some(m) if m <= i64::MAX as u128 => m as i64,
         _ => -1, // overflow or error
     }
+}
+
+/// Run a GPU-accelerated CA tournament. Falls back to CPU if Metal unavailable.
+#[wll::export]
+pub fn ca_tournament_wl(
+    k: i64,
+    r_numer: i64,
+    r_denom: i64,
+    t: i64,
+    rounds: i64,
+    game: String,
+    rules_json: String,
+    use_gpu: bool,
+) -> String {
+    let k = k as u8;
+    let r_f = r_numer as f32 / r_denom as f32;
+    let two_r = (2.0 * r_f).round() as u32;
+    let t = t as u32;
+    let rounds = rounds as u32;
+
+    let dyn_payoff = match tournament::parse_game_dyn(&game) {
+        Ok(p) => p,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    let num_actions = dyn_payoff.num_actions as u8;
+
+    let rule_ids: Vec<u64> = match serde_json::from_str(&rules_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if rule_ids.is_empty() {
+        return "{\"error\":\"no CA rules provided\"}".to_string();
+    }
+
+    let scores: Vec<Vec<i64>>;
+    let used_gpu: bool;
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if use_gpu {
+            match gpu::run_ca_tournament_gpu(
+                &rule_ids, k, two_r, t, rounds,
+                dyn_payoff.num_actions as u32, &dyn_payoff.entries,
+            ) {
+                Ok(s) => {
+                    scores = s;
+                    used_gpu = true;
+                }
+                Err(_e) => {
+                    scores = run_ca_tournament_cpu(
+                        &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
+                    );
+                    used_gpu = false;
+                }
+            };
+        } else {
+            scores = run_ca_tournament_cpu(
+                &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
+            );
+            used_gpu = false;
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = use_gpu;
+        scores = run_ca_tournament_cpu(
+            &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
+        );
+        used_gpu = false;
+    }
+
+    // Build output using mixed-output format with CA specs
+    let specs: Vec<strategy::StrategySpec> = rule_ids
+        .iter()
+        .map(|&rule| strategy::StrategySpec::Ca { rule, k, r: r_f, t, num_actions })
+        .collect();
+    let output = tournament::build_mixed_output(&specs, scores, rounds, &game);
+    let mut json_val = serde_json::to_value(&output).unwrap_or(serde_json::json!({}));
+    json_val["gpu"] = serde_json::json!(used_gpu);
+    serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// CPU fallback for CA tournament using Rayon.
+fn run_ca_tournament_cpu(
+    rule_ids: &[u64],
+    k: u8,
+    two_r: u32,
+    t: u32,
+    rounds: u32,
+    payoff: &tournament::DynPayoff,
+    num_actions: u8,
+) -> Vec<Vec<i64>> {
+    let n = rule_ids.len();
+    let r_f = two_r as f32 / 2.0;
+    let specs: Vec<strategy::StrategySpec> = rule_ids
+        .iter()
+        .map(|&rule| strategy::StrategySpec::Ca { rule, k, r: r_f, t, num_actions })
+        .collect();
+
+    // Play all ordered pairs in parallel
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (0..n).filter(move |&j| i != j).map(move |j| (i, j)))
+        .collect();
+
+    let pair_scores: Vec<(usize, usize, i64)> = pairs
+        .into_par_iter()
+        .map(|(i, j)| {
+            let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
+            let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
+            let (result, _) = strategy::play_game_dyn(&mut runner_a, &mut runner_b, rounds, payoff);
+            let score_a = result.map(|(sa, _)| sa).unwrap_or(0);
+            (i, j, score_a)
+        })
+        .collect();
+
+    let mut matrix = vec![vec![0i64; n]; n];
+    for (i, j, score) in pair_scores {
+        matrix[i][j] = score;
+    }
+    matrix
 }
 
 /// Classify CA rules by behavioral equivalence. Returns JSON with groups.
@@ -766,8 +887,7 @@ pub fn ca_classify_wl(
                     &flat_sigs, sig_len, &candidates, total_rules,
                 );
             }
-            Err(e) => {
-                eprintln!("  CA classify GPU failed, using CPU: {}", e);
+            Err(_e) => {
             }
         }
     }
@@ -790,7 +910,7 @@ pub fn ca_classify_wl(
                     let history_bits: Vec<u8> = (0..history_len)
                         .map(|bit| ((h >> bit) & 1) as u8)
                         .collect();
-                    chunk[sig_idx] = strategy::ca_move(&rule_table, k, two_r, t, &history_bits);
+                    chunk[sig_idx] = strategy::ca_move(&rule_table, k, two_r, t, &history_bits, 2);
                     sig_idx += 1;
                 }
             }
@@ -1148,7 +1268,7 @@ mod tests {
                     let bits: Vec<u8> = (0..history_len)
                         .map(|bit| ((h >> bit) & 1) as u8)
                         .collect();
-                    cpu_sigs[base + idx] = strategy::ca_move(&rule_table, k, two_r, t, &bits);
+                    cpu_sigs[base + idx] = strategy::ca_move(&rule_table, k, two_r, t, &bits, 2);
                     idx += 1;
                 }
             }
@@ -1290,5 +1410,40 @@ mod tests {
             "sum of group sizes {} should equal sampled rules {}",
             total_in_groups, sampled
         );
+    }
+
+    // ── CA tournament GPU vs CPU ────────────────────────────────────────
+
+    #[test]
+    fn ca_tournament_gpu_matches_cpu() {
+        // Run a small CA(2, 1/2) tournament on GPU and CPU, compare scores.
+        let rule_ids: Vec<u64> = (0..16).collect();
+        let k: u8 = 2;
+        let two_r: u32 = 1;
+        let t: u32 = 10;
+        let rounds: u32 = 50;
+        let dyn_payoff = tournament::parse_game_dyn("pd").unwrap();
+        let num_actions = dyn_payoff.num_actions as u8;
+
+        let cpu_scores = run_ca_tournament_cpu(&rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions);
+
+        match gpu::run_ca_tournament_gpu(&rule_ids, k, two_r, t, rounds, dyn_payoff.num_actions as u32, &dyn_payoff.entries) {
+            Ok(gpu_scores) => {
+                assert_eq!(gpu_scores.len(), cpu_scores.len());
+                for i in 0..rule_ids.len() {
+                    for j in 0..rule_ids.len() {
+                        assert_eq!(
+                            gpu_scores[i][j], cpu_scores[i][j],
+                            "Score mismatch at [{},{}]: GPU={} CPU={}",
+                            i, j, gpu_scores[i][j], cpu_scores[i][j]
+                        );
+                    }
+                }
+                eprintln!("  CA tournament GPU vs CPU: all scores match for {} CAs", rule_ids.len());
+            }
+            Err(e) => {
+                eprintln!("  GPU not available, skipping CA tournament comparison: {}", e);
+            }
+        }
     }
 }

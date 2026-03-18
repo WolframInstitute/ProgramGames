@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::PathBuf;
 
-use crate::strategy::{play_game, StrategyRunner, StrategySpec};
+use crate::strategy::{play_game_dyn, StrategyRunner, StrategySpec};
 use crate::TmTransition;
 
 // ── Payoff parsing ──────────────────────────────────────────────────────────
@@ -54,6 +54,69 @@ pub fn parse_game(game: &str) -> Result<Payoff, String> {
             ])
         }
     }
+}
+
+// ── Dynamic (k-action) payoff ────────────────────────────────────────────────
+
+/// Dynamic payoff matrix for k-action games.
+/// entries[move_a * num_actions + move_b] = [score_a, score_b]
+pub struct DynPayoff {
+    pub num_actions: usize,
+    pub entries: Vec<[i32; 2]>,
+}
+
+impl DynPayoff {
+    pub fn get(&self, idx: usize) -> Option<&[i32; 2]> {
+        self.entries.get(idx)
+    }
+}
+
+/// Parse a game string into a DynPayoff supporting any number of actions.
+/// Named games: "pd" (2-action), "chicken" (2-action).
+/// Custom: comma-separated values, count must be 2*k² for some k >= 2.
+pub fn parse_game_dyn(game: &str) -> Result<DynPayoff, String> {
+    // Try named games first
+    match game.trim().to_lowercase().as_str() {
+        "pd" | "prisoners_dilemma" => {
+            return Ok(DynPayoff {
+                num_actions: 2,
+                entries: vec![[-1, -1], [-3, 0], [0, -3], [-2, -2]],
+            });
+        }
+        "chicken" => {
+            return Ok(DynPayoff {
+                num_actions: 2,
+                entries: vec![[0, 0], [-1, 1], [1, -1], [-10, -10]],
+            });
+        }
+        _ => {}
+    }
+
+    // Parse custom: comma-separated values
+    let vals: Vec<i32> = game
+        .split(',')
+        .map(|s| s.trim().parse::<i32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("bad payoff value: {}", e))?;
+
+    if vals.len() < 8 || vals.len() % 2 != 0 {
+        return Err(format!("payoff needs 2*k² values (got {})", vals.len()));
+    }
+
+    let num_outcomes = vals.len() / 2;
+    let num_actions = (num_outcomes as f64).sqrt() as usize;
+    if num_actions * num_actions != num_outcomes {
+        return Err(format!(
+            "payoff count {} is not 2*k² for any k",
+            vals.len()
+        ));
+    }
+
+    let entries: Vec<[i32; 2]> = vals.chunks(2).map(|c| [c[0], c[1]]).collect();
+    Ok(DynPayoff {
+        num_actions,
+        entries,
+    })
 }
 
 // ── TM ID parsing ───────────────────────────────────────────────────────────
@@ -165,8 +228,9 @@ pub fn play_game_cpu(
     symbols: u8,
     max_steps: u32,
     rounds: u32,
-    payoff: &Payoff,
+    payoff: &DynPayoff,
 ) -> (i64, i64) {
+    let na = payoff.num_actions;
     let mut history: Vec<u8> = Vec::with_capacity(2 * rounds as usize);
     let mut score_a = 0i64;
     let mut score_b = 0i64;
@@ -177,17 +241,19 @@ pub fn play_game_cpu(
         } else {
             let (ha, out_a) = run_tm_on_tape(trans_a, symbols, &history, max_steps);
             let (hb, out_b) = run_tm_on_tape(trans_b, symbols, &history, max_steps);
-            let ma = if ha { out_a % 2 } else { 1 }; // timeout -> defect
-            let mb = if hb { out_b % 2 } else { 1 };
+            let ma = if ha { out_a % na as u8 } else { 1 }; // timeout -> defect
+            let mb = if hb { out_b % na as u8 } else { 1 };
             (ma, mb)
         };
 
         history.push(move_a);
         history.push(move_b);
 
-        let idx = (move_a as usize) * 2 + move_b as usize;
-        score_a += payoff[idx][0] as i64;
-        score_b += payoff[idx][1] as i64;
+        let idx = (move_a as usize) * na + move_b as usize;
+        if let Some(payoffs) = payoff.get(idx) {
+            score_a += payoffs[0] as i64;
+            score_b += payoffs[1] as i64;
+        }
     }
 
     (score_a, score_b)
@@ -216,7 +282,7 @@ pub fn run_tournament_cpu(
     symbols: u8,
     max_steps: u32,
     rounds: u32,
-    payoff: &Payoff,
+    payoff: &DynPayoff,
 ) -> Vec<Vec<i64>> {
     let n = ids.len();
     let transitions: Vec<Vec<TmTransition>> = ids
@@ -461,8 +527,20 @@ pub struct MixedRankEntry {
 pub fn run_mixed_tournament_cpu(
     specs: &[StrategySpec],
     rounds: u32,
-    payoff: &Payoff,
+    payoff: &DynPayoff,
 ) -> (Vec<usize>, Vec<Vec<i64>>) {
+    // Set num_actions on each spec from the payoff
+    let mut specs = specs.to_vec();
+    for spec in &mut specs {
+        match spec {
+            StrategySpec::Ca { num_actions, .. }
+            | StrategySpec::Tm { num_actions, .. }
+            | StrategySpec::Fsm { num_actions, .. } => {
+                *num_actions = payoff.num_actions as u8;
+            }
+        }
+    }
+
     let n = specs.len();
     let pairs = all_pairs(n);
 
@@ -490,7 +568,7 @@ pub fn run_mixed_tournament_cpu(
             }
             let mut runner_a = StrategyRunner::new(&specs[i]);
             let mut runner_b = StrategyRunner::new(&specs[j]);
-            let (result, failed_flag) = play_game(&mut runner_a, &mut runner_b, rounds, payoff);
+            let (result, failed_flag) = play_game_dyn(&mut runner_a, &mut runner_b, rounds, payoff);
             if failed_flag != 0 {
                 let mut fs = failed_set.lock().unwrap();
                 if failed_flag & 1 != 0 { fs.insert(i); }
@@ -717,7 +795,7 @@ mod tests {
         // TM 64 always outputs 0 (cooperate). In PD, CC = (-1,-1) each round.
         // Self vs self for 10 rounds → score = -10 each.
         let trans = decode_tm(64, 2, 2);
-        let payoff = parse_game("pd").unwrap();
+        let payoff = parse_game_dyn("pd").unwrap();
         let (sa, sb) = play_game_cpu(&trans, &trans, 2, 500, 10, &payoff);
         assert_eq!(sa, -10);
         assert_eq!(sb, -10);
@@ -729,7 +807,7 @@ mod tests {
         // We'll build one manually: just need a TM where output is always 1.
         // For now, test that round 0 both cooperate.
         let trans = decode_tm(64, 2, 2);
-        let payoff = parse_game("pd").unwrap();
+        let payoff = parse_game_dyn("pd").unwrap();
         let (sa, _sb) = play_game_cpu(&trans, &trans, 2, 500, 1, &payoff);
         // Round 0: both cooperate → CC = (-1, -1)
         assert_eq!(sa, -1);
@@ -739,7 +817,7 @@ mod tests {
     fn tournament_small_cpu() {
         // Run a tiny tournament with 3 known-halting TMs
         let ids = vec![64, 65, 192];
-        let payoff = parse_game("pd").unwrap();
+        let payoff = parse_game_dyn("pd").unwrap();
         let scores = run_tournament_cpu(&ids, 2, 2, 500, 10, &payoff);
         assert_eq!(scores.len(), 3);
         assert_eq!(scores[0].len(), 3);
@@ -787,10 +865,10 @@ mod tests {
         // A mixed tournament with only TMs should produce the same results
         // as the TM-only tournament.
         let specs = vec![
-            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500 },
-            StrategySpec::Tm { id: 65, s: 2, k: 2, max_steps: 500 },
+            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500, num_actions: 2 },
+            StrategySpec::Tm { id: 65, s: 2, k: 2, max_steps: 500, num_actions: 2 },
         ];
-        let payoff = parse_game("pd").unwrap();
+        let payoff = parse_game_dyn("pd").unwrap();
         let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
         assert_eq!(survivors.len(), 2); // both TMs halt
         assert_eq!(scores.len(), 2);
@@ -801,10 +879,10 @@ mod tests {
     #[test]
     fn mixed_tournament_fsm_cooperator_vs_defector() {
         let specs = vec![
-            StrategySpec::Fsm { id: 1, s: 1, k: 2 },
-            StrategySpec::Fsm { id: 0, s: 1, k: 2 },
+            StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
         ];
-        let payoff = parse_game("pd").unwrap();
+        let payoff = parse_game_dyn("pd").unwrap();
         let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
         assert_eq!(survivors.len(), 2); // FSMs always halt
         assert_eq!(scores[0][1], -30);
@@ -814,11 +892,11 @@ mod tests {
     #[test]
     fn mixed_tournament_three_types() {
         let specs = vec![
-            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500 },
-            StrategySpec::Fsm { id: 0, s: 1, k: 2 },
-            StrategySpec::Ca { rule: 110, k: 2, r: 1.0, t: 2 },
+            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500, num_actions: 2 },
+            StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Ca { rule: 110, k: 2, r: 1.0, t: 2, num_actions: 2 },
         ];
-        let payoff = parse_game("pd").unwrap();
+        let payoff = parse_game_dyn("pd").unwrap();
         let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
         assert_eq!(survivors.len(), 3); // all halt
         assert_eq!(scores.len(), 3);
@@ -830,8 +908,8 @@ mod tests {
     #[test]
     fn mixed_output_ranking_sorted() {
         let specs = vec![
-            StrategySpec::Fsm { id: 0, s: 1, k: 2 },
-            StrategySpec::Fsm { id: 1, s: 1, k: 2 },
+            StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 },
         ];
         let scores = vec![vec![0, -30], vec![0, 0]];
         let output = build_mixed_output(&specs, scores, 10, "pd");

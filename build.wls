@@ -1,54 +1,45 @@
 #!/usr/bin/env wolframscript
 
-(* Install build dependencies if needed *)
-If[!PacletObjectQ[PacletObject["PacletExtensions"]],
-    PacletInstall["https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet"]
-];
-
 << ExtensionCargo`
 
-scriptDir = DirectoryName[$InputFileName];
-publisher = "WolframInstitute";
-name = "ProgramGames";
-localPacletDir = FileNameJoin[{scriptDir, name}];
+publisher = "WolframInstitute"
+name = "ProgramGames"
 
-SetDirectory[scriptDir];
+SetDirectory[DirectoryName[$InputFileName]];
 
 (* Ensure cargo is in PATH *)
 SetEnvironment[
     "PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
 ];
 
-(* Build Rust library *)
+(* Build Rust library from the OUTER workspace.
+   This puts artifacts in ProgramGames/target/ (outside the paclet dir)
+   so they don't bloat the archive. *)
 Print["Building Rust library..."]
-PacletDirectoryLoad[localPacletDir];
-paclet = SelectFirst[
-    PacletFind[publisher <> "/" <> name],
-    ExpandFileName[#["Location"]] === ExpandFileName[localPacletDir] &
-];
+RunProcess[{"cargo", "build", "--release"}] //
+    (Print["  cargo exit code: ", #["ExitCode"]]; #) &;
 
-If[MissingQ[paclet],
-    Print["Could not resolve local paclet at ", localPacletDir];
-    Exit[1]
-];
-
-buildResult = CargoBuild[paclet];
-If[!MatchQ[buildResult, {__ ? FileExistsQ}],
-    Print["CargoBuild failed: ", InputForm[buildResult]];
-    Exit[1]
-];
+(* Load paclet and collect binaries *)
+PacletDirectoryLoad[name]
+paclet = PacletObject[publisher <> "/" <> name]
 
 Print["Collecting binaries..."]
 Quiet[DeleteDirectory[FileNameJoin[{name, "Binaries"}], DeleteContents -> True]];
-CargoCollect[scriptDir, FileNameJoin[{name, "Binaries"}]];
+CargoCollect[ParentDirectory[paclet["Location"]], FileNameJoin[{name, "Binaries"}]]
+
+(* Clean any inner build artifacts before archiving *)
+Quiet[DeleteDirectory[FileNameJoin[{name, "build"}], DeleteContents -> True]];
+Quiet[DeleteDirectory[FileNameJoin[{name, "Lib", "target"}], DeleteContents -> True]];
 
 (* Create paclet archive *)
 Print["Creating paclet archive..."]
-pacletFile = CreatePacletArchive[name];
-Echo[StringTemplate["Paclet `` has size ``"][pacletFile, FileSize[pacletFile]]];
+buildDir = "build";
+If[!DirectoryQ[buildDir], CreateDirectory[buildDir]];
+pacletFile = CreatePacletArchive[name, buildDir]
+Echo[StringTemplate["Paclet `` has size ``"][pacletFile, FileSize[pacletFile]]]
 
-PacletDirectoryUnload[localPacletDir];
+PacletDirectoryUnload[name]
 
 (* Install locally *)
-PacletInstall[pacletFile, ForceVersionInstall -> True];
-Print["Done. Paclet installed."]
+PacletInstall[pacletFile, ForceVersionInstall -> True]
+Print["Done. Paclet installed: ", pacletFile]
