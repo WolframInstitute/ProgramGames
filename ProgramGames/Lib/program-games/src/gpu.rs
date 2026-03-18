@@ -1102,6 +1102,293 @@ kernel void ca_classify(
             Ok((raw.to_vec(), sig_len as usize))
         }
     }
+
+    // ── FSM Tournament on Metal ────────────────────────────────────────
+
+    /// Build the FSM tournament shader source with the correct MAX_STATES define.
+    fn fsm_tournament_shader_source(max_states: usize) -> String {
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define FSM_MAX_STATES {max_states}u
+
+struct FsmGameParams {{
+    uint num_pairs;
+    uint states;
+    uint alphabet;
+    uint rounds;
+    uint num_actions;
+    uint _pad[3];
+}};
+
+kernel void fsm_tournament(
+    device const uint* starts        [[buffer(0)]],
+    device const uint* outputs       [[buffer(1)]],
+    device const uint* transitions   [[buffer(2)]],
+    device const uint2* pairs        [[buffer(3)]],
+    device int2* scores              [[buffer(4)]],
+    constant FsmGameParams& params   [[buffer(5)]],
+    device const int* payoff         [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{{
+    if (gid >= params.num_pairs) return;
+
+    uint a_idx = pairs[gid].x;
+    uint b_idx = pairs[gid].y;
+    uint S = params.states;
+    uint K = params.alphabet;
+    uint na = params.num_actions;
+
+    uint a_state = starts[a_idx];
+    uint b_state = starts[b_idx];
+
+    int score_a = 0;
+    int score_b = 0;
+
+    // Cycle detection: combined state = a_state * S + b_state
+    // Maximum combined states = S * S. When we see a repeated combined
+    // state, we have found a cycle and can extrapolate in O(1).
+    const uint max_combined = FSM_MAX_STATES * FSM_MAX_STATES;
+    uint cycle_round[FSM_MAX_STATES * FSM_MAX_STATES];
+    int cycle_sa[FSM_MAX_STATES * FSM_MAX_STATES];
+    int cycle_sb[FSM_MAX_STATES * FSM_MAX_STATES];
+    for (uint i = 0u; i < max_combined; i++) {{
+        cycle_round[i] = 0xFFFFFFFFu;
+    }}
+
+    for (uint round = 0u; round < params.rounds; round++) {{
+        uint combined = a_state * S + b_state;
+        if (combined < max_combined) {{
+            if (cycle_round[combined] != 0xFFFFFFFFu) {{
+                uint cycle_len = round - cycle_round[combined];
+                if (cycle_len > 0u) {{
+                    int delta_a = score_a - cycle_sa[combined];
+                    int delta_b = score_b - cycle_sb[combined];
+                    uint remaining = params.rounds - round;
+                    uint full_cycles = remaining / cycle_len;
+                    score_a += int(full_cycles) * delta_a;
+                    score_b += int(full_cycles) * delta_b;
+                    uint leftover = remaining - full_cycles * cycle_len;
+                    for (uint r = 0u; r < leftover; r++) {{
+                        uint aa = outputs[a_idx * S + a_state] % na;
+                        uint ba = outputs[b_idx * S + b_state] % na;
+                        uint pidx = aa * na + ba;
+                        score_a += payoff[pidx * 2];
+                        score_b += payoff[pidx * 2 + 1];
+                        uint new_a = transitions[a_idx * S * K + a_state * K + ba];
+                        uint new_b = transitions[b_idx * S * K + b_state * K + aa];
+                        a_state = new_a;
+                        b_state = new_b;
+                    }}
+                    scores[gid] = int2(score_a, score_b);
+                    return;
+                }}
+            }}
+            cycle_round[combined] = round;
+            cycle_sa[combined] = score_a;
+            cycle_sb[combined] = score_b;
+        }}
+
+        uint a_action = outputs[a_idx * S + a_state] % na;
+        uint b_action = outputs[b_idx * S + b_state] % na;
+        uint pidx = a_action * na + b_action;
+        score_a += payoff[pidx * 2];
+        score_b += payoff[pidx * 2 + 1];
+
+        uint new_a = transitions[a_idx * S * K + a_state * K + b_action];
+        uint new_b = transitions[b_idx * S * K + b_state * K + a_action];
+        a_state = new_a;
+        b_state = new_b;
+    }}
+
+    scores[gid] = int2(score_a, score_b);
+}}
+"#,
+            max_states = max_states
+        )
+    }
+
+    pub struct MetalFsmTournament {
+        device: Device,
+        queue: CommandQueue,
+        pipeline: ComputePipelineState,
+    }
+
+    impl MetalFsmTournament {
+        pub fn new(max_states: usize) -> Result<Self, String> {
+            let device =
+                Device::system_default().ok_or("Metal device unavailable")?;
+            let source = fsm_tournament_shader_source(max_states);
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(&source, &options)
+                .map_err(|e| format!("Metal FSM tournament shader compile: {e}"))?;
+            let func = library
+                .get_function("fsm_tournament", None)
+                .map_err(|e| format!("Metal FSM tournament function: {e}"))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("Metal FSM tournament pipeline: {e}"))?;
+            let queue = device.new_command_queue();
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+            })
+        }
+
+        pub fn run_tournament(
+            &self,
+            fsm_ids: &[u64],
+            states: usize,
+            symbols: usize,
+            rounds: u32,
+            num_actions: u32,
+            payoff_entries: &[[i32; 2]],
+        ) -> Result<Vec<Vec<i64>>, String> {
+            let n = fsm_ids.len();
+            if n == 0 {
+                return Ok(vec![]);
+            }
+
+            // Decode all FSMs
+            let mut flat_starts: Vec<u32> = Vec::with_capacity(n);
+            let mut flat_outputs: Vec<u32> = Vec::with_capacity(n * states);
+            let mut flat_transitions: Vec<u32> = Vec::with_capacity(n * states * symbols);
+
+            for &id in fsm_ids {
+                let (outputs, transitions) =
+                    super::super::strategy::decode_fsm(id, states, symbols);
+                flat_starts.push(0u32); // all FSMs start in state 0
+                for &o in &outputs {
+                    flat_outputs.push(o as u32);
+                }
+                for &t in &transitions {
+                    flat_transitions.push(t as u32);
+                }
+            }
+
+            // Build all ordered pairs (i, j) where i != j
+            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * (n - 1));
+            for i in 0..n {
+                for j in 0..n {
+                    if i != j {
+                        all_pairs.push([i as u32, j as u32]);
+                    }
+                }
+            }
+
+            // Flatten payoff entries into interleaved [score_a, score_b, ...] for GPU
+            let payoff_flat: Vec<i32> = payoff_entries
+                .iter()
+                .flat_map(|&[a, b]| vec![a, b])
+                .collect();
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct FsmGameParams {
+                num_pairs: u32,
+                states: u32,
+                alphabet: u32,
+                rounds: u32,
+                num_actions: u32,
+                _pad: [u32; 3],
+            }
+
+            // Upload shared data once
+            let starts_buf = self.buf_from_slice(&flat_starts);
+            let outputs_buf = self.buf_from_slice(&flat_outputs);
+            let transitions_buf = self.buf_from_slice(&flat_transitions);
+            let payoff_buf = self.buf_from_slice(&payoff_flat);
+
+            // Process pairs in batches
+            const BATCH_SIZE: usize = 5_000_000;
+            let mut matrix = vec![vec![0i64; n]; n];
+
+            for (batch_idx, batch) in all_pairs.chunks(BATCH_SIZE).enumerate() {
+                let batch_len = batch.len();
+                let params = FsmGameParams {
+                    num_pairs: batch_len as u32,
+                    states: states as u32,
+                    alphabet: symbols as u32,
+                    rounds,
+                    num_actions,
+                    _pad: [0; 3],
+                };
+
+                let pairs_buf = self.buf_from_slice(batch);
+                let scores_buf = self.device.new_buffer(
+                    (batch_len.max(1) * size_of::<[i32; 2]>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                unsafe {
+                    std::ptr::write_bytes(
+                        scores_buf.contents() as *mut u8,
+                        0,
+                        batch_len * size_of::<[i32; 2]>(),
+                    );
+                }
+
+                let cmd_buf = self.queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.pipeline);
+                encoder.set_buffer(0, Some(&starts_buf), 0);
+                encoder.set_buffer(1, Some(&outputs_buf), 0);
+                encoder.set_buffer(2, Some(&transitions_buf), 0);
+                encoder.set_buffer(3, Some(&pairs_buf), 0);
+                encoder.set_buffer(4, Some(&scores_buf), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<FsmGameParams>() as u64,
+                    (&params as *const FsmGameParams).cast(),
+                );
+                encoder.set_buffer(6, Some(&payoff_buf), 0);
+
+                let width = self.pipeline.thread_execution_width().max(1);
+                let threads_per_group = MTLSize::new(width, 1, 1);
+                let groups = MTLSize::new(
+                    (batch_len as u64 + width - 1) / width,
+                    1,
+                    1,
+                );
+                encoder.dispatch_thread_groups(groups, threads_per_group);
+                encoder.end_encoding();
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
+
+                // Read batch results into score matrix
+                let raw_scores = unsafe {
+                    let ptr = scores_buf.contents() as *const [i32; 2];
+                    std::slice::from_raw_parts(ptr, batch_len)
+                };
+
+                let batch_start = batch_idx * BATCH_SIZE;
+                for (local_idx, score) in raw_scores.iter().enumerate() {
+                    let pair = all_pairs[batch_start + local_idx];
+                    matrix[pair[0] as usize][pair[1] as usize] = score[0] as i64;
+                }
+            }
+
+            Ok(matrix)
+        }
+
+        fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
+            if slice.is_empty() {
+                return self.device.new_buffer(
+                    4,
+                    MTLResourceOptions::StorageModeShared,
+                );
+            }
+            let len = (slice.len() * size_of::<T>()) as u64;
+            self.device.new_buffer_with_data(
+                slice.as_ptr() as *const c_void,
+                len,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+    }
 }
 
 // Re-export
@@ -1200,6 +1487,32 @@ pub fn compute_ca_sig_len(depth: u32) -> u32 {
         }
     }
     len
+}
+
+/// Run an FSM tournament on GPU. Returns score_matrix[i][j].
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn run_fsm_tournament_gpu(
+    fsm_ids: &[u64],
+    states: usize,
+    symbols: usize,
+    rounds: u32,
+    num_actions: u32,
+    payoff_entries: &[[i32; 2]],
+) -> Result<Vec<Vec<i64>>, String> {
+    let gpu = metal_impl::MetalFsmTournament::new(states)?;
+    gpu.run_tournament(fsm_ids, states, symbols, rounds, num_actions, payoff_entries)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn run_fsm_tournament_gpu(
+    _fsm_ids: &[u64],
+    _states: usize,
+    _symbols: usize,
+    _rounds: u32,
+    _num_actions: u32,
+    _payoff_entries: &[[i32; 2]],
+) -> Result<Vec<Vec<i64>>, String> {
+    Err("Metal not available".to_string())
 }
 
 /// Check if Metal is available at runtime.

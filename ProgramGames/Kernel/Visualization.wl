@@ -128,7 +128,8 @@ Options[ClassificationTable] = {
 
 $DefaultClassificationSpaces = {
 	{"TM", 2, 2}, {"TM", 3, 2}, {"TM", 2, 3},
-	{"CA", 2, 1/2}, {"CA", 2, 1}, {"CA", 2, 3/2}
+	{"CA", 2, 1/2}, {"CA", 2, 1}, {"CA", 2, 3/2},
+	{"FSM", 1, 2}, {"FSM", 2, 2}, {"FSM", 3, 2}
 };
 
 
@@ -186,6 +187,33 @@ iClassifySpace[{"CA", k_Integer, r_}, maxsteps_, depth_, sample_] :=
 				"FullPairs" -> With[{cl = Lookup[c, "SampledRules", totalRules]}, cl * (cl - 1)],
 				"Time" -> timing,
 				"Method" -> If[totalRules > 10000000, "sampled", "exhaustive"]|>
+		]
+	]
+
+
+iClassifySpace[{"FSM", s_Integer, k_Integer}, maxsteps_, depth_, sample_] :=
+	Module[{totalFSMs, c, timing},
+		totalFSMs = FiniteStateMachineMaxIndex[s, k];
+		timing = First @ AbsoluteTiming[
+			c = FiniteStateMachineClassify[s, k,
+				"Depth" -> depth,
+				"Sample" -> If[totalFSMs > 10000000, sample, "all"]];
+		];
+		If[c === $Failed,
+			<|"Space" -> StringForm["FSM(``,``)", s, k],
+				"SpaceSize" -> totalFSMs,
+				"Classified" -> "?", "Unique" -> "?", "Reduction" -> "?",
+				"UniquePairs" -> "?", "FullPairs" -> "?",
+				"Time" -> timing, "Method" -> "failed"|>,
+			<|"Space" -> StringForm["FSM(``,``)", s, k],
+				"SpaceSize" -> totalFSMs,
+				"Classified" -> Lookup[c, "SampledRules", totalFSMs],
+				"Unique" -> c["UniqueCount"],
+				"Reduction" -> c["ReductionFactor"],
+				"UniquePairs" -> c["UniqueCount"] (c["UniqueCount"] - 1),
+				"FullPairs" -> With[{cl = Lookup[c, "SampledRules", totalFSMs]}, cl * (cl - 1)],
+				"Time" -> timing,
+				"Method" -> If[totalFSMs > 10000000, "sampled", "exhaustive"]|>
 		]
 	]
 

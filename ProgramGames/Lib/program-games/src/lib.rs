@@ -957,6 +957,187 @@ fn ca_classify_group_signatures_indexed(
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Classify FSMs by behavioral equivalence using two-step canonicalization.
+/// Returns JSON with groups.
+///
+/// Two-step process (matching nit-games `fsm_enum.rs`):
+/// 1. Canonicalize: decode -> BFS-reorder states -> structural key -> dedup
+/// 2. Behavioral grouping: run canonical reps through all input sequences (12 steps)
+///    -> group by output trace -> unique behavior representatives
+///
+/// `states`/`symbols` define the FSM space; `depth` is unused (kept for API compat,
+/// trace length is fixed at 12 like nit); `sample=0` means exhaustive, `sample>0`
+/// means random sample of that size.
+#[wll::export]
+pub fn fsm_classify_wl(
+    states: i64,
+    symbols: i64,
+    _depth: i64,
+    sample: i64,
+) -> String {
+    let states = states as usize;
+    let symbols = symbols as usize;
+    let sample = if sample > 0 { sample as usize } else { 0 };
+
+    match strategy::fsm_classify_two_step(states, symbols, sample) {
+        Ok(result) => {
+            let group_entries: Vec<serde_json::Value> = result
+                .groups
+                .iter()
+                .map(|members| {
+                    serde_json::json!({
+                        "representative": members[0],
+                        "members": members,
+                        "size": members.len()
+                    })
+                })
+                .collect();
+
+            let sampled = result.sampled_rules as u64;
+            let output = serde_json::json!({
+                "representatives": result.representatives,
+                "groups": group_entries,
+                "unique_behaviors": result.unique_behaviors,
+                "total_rules": result.total_rules as u64,
+                "canonical_count": result.canonical_count,
+                "sampled_rules": sampled,
+                "reduction_factor": if result.unique_behaviors > 0 {
+                    sampled as f64 / result.unique_behaviors as f64
+                } else {
+                    0.0
+                }
+            });
+
+            serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+        }
+        Err(e) => format!("{{\"error\":\"{}\"}}", e),
+    }
+}
+
+/// Run a GPU-accelerated FSM tournament. Falls back to CPU if Metal unavailable.
+#[wll::export]
+pub fn fsm_tournament_wl(
+    states: i64,
+    symbols: i64,
+    rounds: i64,
+    game: String,
+    fsm_ids_json: String,
+    use_gpu: bool,
+) -> String {
+    let states = states as usize;
+    let symbols = symbols as usize;
+    let rounds = rounds as u32;
+
+    let dyn_payoff = match tournament::parse_game_dyn(&game) {
+        Ok(p) => p,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    let num_actions = dyn_payoff.num_actions as u8;
+
+    let fsm_ids: Vec<u64> = match serde_json::from_str(&fsm_ids_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if fsm_ids.is_empty() {
+        return "{\"error\":\"no FSM IDs provided\"}".to_string();
+    }
+
+    let scores: Vec<Vec<i64>>;
+    let used_gpu: bool;
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if use_gpu {
+            match gpu::run_fsm_tournament_gpu(
+                &fsm_ids, states, symbols, rounds,
+                dyn_payoff.num_actions as u32, &dyn_payoff.entries,
+            ) {
+                Ok(s) => {
+                    scores = s;
+                    used_gpu = true;
+                }
+                Err(_e) => {
+                    scores = run_fsm_tournament_cpu(
+                        &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
+                    );
+                    used_gpu = false;
+                }
+            };
+        } else {
+            scores = run_fsm_tournament_cpu(
+                &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
+            );
+            used_gpu = false;
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = use_gpu;
+        scores = run_fsm_tournament_cpu(
+            &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
+        );
+        used_gpu = false;
+    }
+
+    // Build output using mixed-output format with FSM specs
+    let specs: Vec<strategy::StrategySpec> = fsm_ids
+        .iter()
+        .map(|&id| strategy::StrategySpec::Fsm {
+            id,
+            s: states as u16,
+            k: symbols as u8,
+            num_actions,
+        })
+        .collect();
+    let output = tournament::build_mixed_output(&specs, scores, rounds, &game);
+    let mut json_val = serde_json::to_value(&output).unwrap_or(serde_json::json!({}));
+    json_val["gpu"] = serde_json::json!(used_gpu);
+    serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// CPU fallback for FSM tournament using Rayon.
+fn run_fsm_tournament_cpu(
+    fsm_ids: &[u64],
+    states: usize,
+    symbols: usize,
+    rounds: u32,
+    payoff: &tournament::DynPayoff,
+    num_actions: u8,
+) -> Vec<Vec<i64>> {
+    let n = fsm_ids.len();
+    let specs: Vec<strategy::StrategySpec> = fsm_ids
+        .iter()
+        .map(|&id| strategy::StrategySpec::Fsm {
+            id,
+            s: states as u16,
+            k: symbols as u8,
+            num_actions,
+        })
+        .collect();
+
+    // Play all ordered pairs in parallel
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (0..n).filter(move |&j| i != j).map(move |j| (i, j)))
+        .collect();
+
+    let pair_scores: Vec<(usize, usize, i64)> = pairs
+        .into_par_iter()
+        .map(|(i, j)| {
+            let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
+            let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
+            let (result, _) = strategy::play_game_dyn(&mut runner_a, &mut runner_b, rounds, payoff);
+            let score_a = result.map(|(sa, _)| sa).unwrap_or(0);
+            (i, j, score_a)
+        })
+        .collect();
+
+    let mut matrix = vec![vec![0i64; n]; n];
+    for (i, j, score) in pair_scores {
+        matrix[i][j] = score;
+    }
+    matrix
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1445,5 +1626,33 @@ mod tests {
                 eprintln!("  GPU not available, skipping CA tournament comparison: {}", e);
             }
         }
+    }
+
+    // ── FSM classify reduction table ────────────────────────────────────
+
+    #[test]
+    fn fsm_classify_reduction_table() {
+        eprintln!();
+        eprintln!("  {:<12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "Space", "Total", "Canonical", "Unique", "Struct.x", "Behav.x");
+        eprintln!("  {}", "-".repeat(62));
+
+        for (s, k) in [(1, 2), (2, 2), (3, 2), (4, 2)] {
+            let result_str = fsm_classify_wl(s, k as i64, 4, 0);
+            let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
+            let total = parsed["total_rules"].as_u64().unwrap();
+            let canonical = parsed["canonical_count"].as_u64().unwrap();
+            let unique = parsed["unique_behaviors"].as_u64().unwrap();
+            let structural_reduction = if canonical > 0 { total as f64 / canonical as f64 } else { 0.0 };
+            let behavioral_reduction = if unique > 0 { canonical as f64 / unique as f64 } else { 0.0 };
+
+            eprintln!("  FSM({},{})    {:>10} {:>10} {:>10} {:>10.1} {:>10.1}",
+                s, k, total, canonical, unique, structural_reduction, behavioral_reduction);
+
+            assert!(canonical <= total, "canonical should be <= total");
+            assert!(unique <= canonical, "unique should be <= canonical");
+            assert!(unique >= 1, "should have at least 1 unique behavior");
+        }
+        eprintln!();
     }
 }

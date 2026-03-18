@@ -25,8 +25,8 @@ round-robin tournament among TM ids. Options: \"MaxSteps\", \"Rounds\", \"Game\"
 CellularAutomatonTournament::usage = "CellularAutomatonTournament[rules] runs a GPU-accelerated \
 tournament among cellular automaton rules. Options: \"Colors\", \"Radius\", \"Steps\", \"Rounds\", \"Game\", \"GPU\".";
 
-FiniteStateMachineTournament::usage = "FiniteStateMachineTournament[ids] runs a tournament \
-among FSM ids. Options: \"States\", \"Colors\", \"Rounds\", \"Game\".";
+FiniteStateMachineTournament::usage = "FiniteStateMachineTournament[ids] runs a GPU-accelerated \
+tournament among FSM ids. Options: \"States\", \"Colors\", \"Rounds\", \"Game\", \"GPU\".";
 
 ProgramTournament::usage = "ProgramTournament[strategies] runs a mixed-type tournament. \
 Strategies: {\"TM\",id,s,k}, {\"TM\",id,s,k,maxSteps}, {\"FSM\",id,s,k}, {\"CA\",rule,k,r,t}. \
@@ -208,12 +208,30 @@ CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
 
 Options[FiniteStateMachineTournament] = {
 	"States" -> 2, "Colors" -> 2,
-	"Rounds" -> 100, "Game" -> "pd"
+	"Rounds" -> 100, "Game" -> "pd", "GPU" -> True
 };
 
 FiniteStateMachineTournament[fsmIds_List, opts : OptionsPattern[]] :=
-	ProgramTournament[
-		{"FSM", #, OptionValue["States"], OptionValue["Colors"]} & /@ fsmIds,
-		"Rounds" -> OptionValue["Rounds"],
-		"Game" -> OptionValue["Game"]
+	Module[{s, k, gameStr, resultJSON, result},
+		s = OptionValue["States"];
+		k = OptionValue["Colors"];
+		gameStr = PayoffToString[OptionValue["Game"]];
+		resultJSON = FSMTournamentWL[s, k,
+			OptionValue["Rounds"],
+			gameStr, ExportString[fsmIds, "RawJSON"],
+			TrueQ[OptionValue["GPU"]]];
+		If[FailureQ[resultJSON], Return[$Failed]];
+		result = ImportString[resultJSON, "RawJSON"];
+		<|
+			"Strategies" -> (iParseLabel /@ result["strategies"]),
+			"Labels" -> (iParseLabel /@ Lookup[result["ranking"], "label"]),
+			"Scores" -> result["scores"],
+			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b", iParseLabel],
+			"Ranking" -> Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]],
+			"Rounds" -> result["rounds"],
+			"Game" -> result["game"],
+			"NumStrategies" -> result["num_strategies"],
+			"NumPairs" -> result["num_pairs"],
+			"GPU" -> TrueQ[result["gpu"]]
+		|>
 	]

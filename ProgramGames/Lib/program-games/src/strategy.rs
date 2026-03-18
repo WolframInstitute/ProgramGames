@@ -476,6 +476,325 @@ fn checked_pow_usize(base: usize, exp: usize) -> Option<usize> {
     Some(value)
 }
 
+// ── FSM two-step classification (canonicalize + behavioral grouping) ─────────
+
+use rayon::prelude::*;
+use std::collections::{HashMap, VecDeque};
+
+/// Raw decoded FSM for canonicalization (outputs + transitions as Vec<Vec<usize>>)
+#[derive(Clone, Debug)]
+pub struct RawFsm {
+    pub outputs: Vec<usize>,          // outputs[state] = action
+    pub transitions: Vec<Vec<usize>>, // transitions[state][input] = next_state
+    pub actions: usize,
+}
+
+impl RawFsm {
+    pub fn states(&self) -> usize {
+        self.outputs.len()
+    }
+}
+
+/// Decode FSM index to RawFsm (same encoding as decode_fsm but returns RawFsm struct).
+pub fn decode_fsm_raw(index: u64, states: usize, actions: usize) -> Result<RawFsm, String> {
+    if states == 0 {
+        return Err("fsm decode requires states > 0".to_string());
+    }
+    if actions == 0 {
+        return Err("fsm decode requires actions > 0".to_string());
+    }
+    let Some(max) = fsm_count(states, actions) else {
+        return Err("fsm index space overflows u128 for this (states, actions)".to_string());
+    };
+    if (index as u128) >= max {
+        return Err(format!("fsm index {index} out of range (0..{})", max - 1));
+    }
+
+    let transition_digits = states.saturating_mul(actions);
+    let Some(action_block) = checked_pow_u128(actions as u128, states as u32) else {
+        return Err("fsm action block overflows u128".to_string());
+    };
+    let (transition_code, output_code) =
+        floor_div_rem_i128(index as i128 - 1, action_block as i128);
+
+    let transitions_flat = if states == 1 {
+        vec![0usize; transition_digits]
+    } else {
+        integer_digits_unsigned(transition_code.unsigned_abs(), states, transition_digits)
+    };
+    let outputs = if actions == 1 {
+        vec![0usize; states]
+    } else {
+        integer_digits_unsigned(output_code as u128, actions, states)
+    };
+
+    let mut transitions = vec![vec![0usize; actions]; states];
+    for (state_idx, row) in transitions.iter_mut().enumerate() {
+        for (input_idx, cell) in row.iter_mut().enumerate() {
+            let flat_idx = state_idx.saturating_mul(actions).saturating_add(input_idx);
+            let next = transitions_flat.get(flat_idx).copied().unwrap_or(0);
+            *cell = next.min(states - 1);
+        }
+    }
+
+    Ok(RawFsm {
+        outputs,
+        transitions,
+        actions,
+    })
+}
+
+/// BFS-canonicalize: reorder states starting from `start_state`, drop unreachable.
+pub fn canonicalize_raw_fsm(raw: &RawFsm, start_state: usize) -> RawFsm {
+    if raw.states() == 0 {
+        return raw.clone();
+    }
+    let start = start_state.min(raw.states().saturating_sub(1));
+    let mut state_map = vec![None; raw.states()];
+    let mut order = Vec::with_capacity(raw.states());
+    let mut queue = VecDeque::new();
+    let mut next_id = 1usize;
+    state_map[start] = Some(0usize);
+    queue.push_back(start);
+
+    while let Some(state) = queue.pop_front() {
+        order.push(state);
+        let row = raw.transitions.get(state);
+        for input in 0..raw.actions {
+            let next = row
+                .and_then(|r| r.get(input))
+                .copied()
+                .unwrap_or(state)
+                .min(raw.states().saturating_sub(1));
+            if state_map[next].is_none() {
+                state_map[next] = Some(next_id);
+                next_id += 1;
+                queue.push_back(next);
+            }
+        }
+    }
+
+    let mut outputs = Vec::with_capacity(order.len());
+    let mut transitions = Vec::with_capacity(order.len());
+    for &state in &order {
+        outputs.push(raw.outputs.get(state).copied().unwrap_or(0));
+        let mut row = Vec::with_capacity(raw.actions);
+        for input in 0..raw.actions {
+            let next = raw
+                .transitions
+                .get(state)
+                .and_then(|r| r.get(input))
+                .copied()
+                .unwrap_or(state)
+                .min(raw.states().saturating_sub(1));
+            row.push(state_map[next].unwrap_or(0));
+        }
+        transitions.push(row);
+    }
+
+    RawFsm {
+        outputs,
+        transitions,
+        actions: raw.actions,
+    }
+}
+
+/// Structural key for deduplication (flattened outputs + transitions).
+pub fn raw_fsm_key(raw: &RawFsm) -> Vec<u16> {
+    let mut key = Vec::with_capacity(raw.states().saturating_mul(raw.actions + 1));
+    for output in &raw.outputs {
+        key.push(*output as u16);
+    }
+    for row in &raw.transitions {
+        for next in row {
+            key.push(*next as u16);
+        }
+    }
+    key
+}
+
+/// Behavioral trace signature: run FSM on all input sequences of given length,
+/// record output trace. Two FSMs with the same trace behave identically.
+pub fn behavior_trace_signature(raw: &RawFsm, steps: usize) -> Vec<u16> {
+    if raw.states() == 0 || raw.actions == 0 || steps == 0 {
+        return Vec::new();
+    }
+    let sequence_count = match checked_pow_u128(raw.actions as u128, steps as u32) {
+        Some(c) if c <= usize::MAX as u128 => c as usize,
+        _ => return Vec::new(),
+    };
+    let capacity = sequence_count.saturating_mul(steps);
+    let mut signature = Vec::with_capacity(capacity);
+    let mut digits = vec![0usize; steps];
+
+    for sequence_idx in 0..sequence_count {
+        let mut code = sequence_idx;
+        for pos in (0..steps).rev() {
+            let digit = code % raw.actions;
+            code /= raw.actions;
+            digits[pos] = raw.actions - 1 - digit;
+        }
+
+        let mut state = 0usize;
+        for &input in &digits {
+            let next = raw
+                .transitions
+                .get(state)
+                .and_then(|row| row.get(input))
+                .copied()
+                .unwrap_or(state)
+                .min(raw.states().saturating_sub(1));
+            let out = raw.outputs.get(next).copied().unwrap_or(0);
+            signature.push(out as u16);
+            state = next;
+        }
+    }
+
+    signature
+}
+
+const NOTEBOOK_BEHAVIOR_TRACE_STEPS: usize = 12;
+
+fn insert_min_index(map: &mut HashMap<Vec<u16>, u64>, key: Vec<u16>, idx: u64) {
+    if let Some(existing) = map.get_mut(&key) {
+        *existing = (*existing).min(idx);
+    } else {
+        map.insert(key, idx);
+    }
+}
+
+fn merge_min_index_maps(left: &mut HashMap<Vec<u16>, u64>, right: HashMap<Vec<u16>, u64>) {
+    for (key, idx) in right {
+        insert_min_index(left, key, idx);
+    }
+}
+
+/// Two-step FSM classification result.
+pub struct FsmClassification {
+    /// Representatives of unique behavioral groups (min-index per group).
+    pub representatives: Vec<u64>,
+    /// Groups of FSM indices sharing the same behavior.
+    pub groups: Vec<Vec<u64>>,
+    /// Number of unique behaviors.
+    pub unique_behaviors: usize,
+    /// Total FSM index space.
+    pub total_rules: u128,
+    /// Number of structurally unique FSMs (after canonicalization, before behavioral grouping).
+    pub canonical_count: usize,
+    /// How many FSMs were actually examined.
+    pub sampled_rules: usize,
+}
+
+/// Perform two-step FSM classification:
+/// 1. Canonicalize (BFS-reorder + structural dedup) -> canonical representatives
+/// 2. Behavioral grouping (12-step trace) -> unique behavior groups
+///
+/// `states`/`actions` define the FSM space.
+/// If `sample > 0`, randomly sample that many indices; otherwise exhaustive.
+pub fn fsm_classify_two_step(
+    states: usize,
+    actions: usize,
+    sample: usize,
+) -> Result<FsmClassification, String> {
+    let total_rules = fsm_count(states, actions)
+        .ok_or_else(|| "fsm space overflow".to_string())?;
+
+    if total_rules == 0 {
+        return Ok(FsmClassification {
+            representatives: Vec::new(),
+            groups: Vec::new(),
+            unique_behaviors: 0,
+            total_rules,
+            canonical_count: 0,
+            sampled_rules: 0,
+        });
+    }
+
+    // Build candidate list: exhaustive or random sample
+    let candidates: Vec<u64> = if sample > 0 {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let target = (sample as u128).min(total_rules);
+        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(42).wrapping_add(0xBu64);
+        while (seen.len() as u128) < target {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let hi = rng_state >> 32;
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let lo = rng_state >> 32;
+            let full = (hi << 32) | lo;
+            let idx = (full as u128 % total_rules) as u64;
+            seen.insert(idx);
+        }
+        let mut v: Vec<u64> = seen.into_iter().collect();
+        v.sort_unstable();
+        v
+    } else {
+        if total_rules > u64::MAX as u128 {
+            return Err("fsm space too large for exhaustive enumeration".to_string());
+        }
+        (0..total_rules as u64).collect()
+    };
+
+    let sampled_rules = candidates.len();
+
+    // Step 1: Canonicalize each FSM index -> structural key, keep min-index per key
+    let canonical_by_key = candidates
+        .par_iter()
+        .try_fold(HashMap::new, |mut local: HashMap<Vec<u16>, u64>, &idx| {
+            let raw = decode_fsm_raw(idx, states, actions)?;
+            let canonical = canonicalize_raw_fsm(&raw, 0);
+            let key = raw_fsm_key(&canonical);
+            insert_min_index(&mut local, key, idx);
+            Ok::<_, String>(local)
+        })
+        .try_reduce(HashMap::new, |mut left, right| {
+            merge_min_index_maps(&mut left, right);
+            Ok::<_, String>(left)
+        })?;
+
+    let canonical_count = canonical_by_key.len();
+    let mut canonical_reps: Vec<u64> = canonical_by_key.into_values().collect();
+    canonical_reps.sort_unstable();
+
+    // Step 2: For each canonical representative, compute behavioral trace -> group by behavior
+    let behavior_by_key = canonical_reps
+        .par_iter()
+        .try_fold(HashMap::new, |mut local: HashMap<Vec<u16>, Vec<u64>>, &idx| {
+            let raw = decode_fsm_raw(idx, states, actions)?;
+            let trace = behavior_trace_signature(&raw, NOTEBOOK_BEHAVIOR_TRACE_STEPS);
+            local.entry(trace).or_default().push(idx);
+            Ok::<_, String>(local)
+        })
+        .try_reduce(HashMap::new, |mut left, right| {
+            for (key, mut members) in right {
+                left.entry(key).or_default().append(&mut members);
+            }
+            Ok::<_, String>(left)
+        })?;
+
+    let mut groups: Vec<Vec<u64>> = behavior_by_key.into_values().collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    groups.sort_unstable_by_key(|g| g[0]);
+
+    let representatives: Vec<u64> = groups.iter().map(|g| g[0]).collect();
+    let unique_behaviors = groups.len();
+
+    Ok(FsmClassification {
+        representatives,
+        groups,
+        unique_behaviors,
+        total_rules,
+        canonical_count,
+        sampled_rules,
+    })
+}
+
 // ── Generalized game play ────────────────────────────────────────────────────
 
 /// Play one iterated game between two strategy runners.

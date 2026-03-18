@@ -14,3 +14,6 @@ Binaries/
 
 # Vim stuff
 *.sw?
+
+# CI artifacts
+paclet_version.txt

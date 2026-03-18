@@ -33,6 +33,8 @@ PacletObject[
           "WolframInstitute`ProgramGames`CellularAutomatonClassify",
           "WolframInstitute`ProgramGames`CellularAutomatonMaxIndex",
           "WolframInstitute`ProgramGames`CellularAutomatonTournament",
+          "WolframInstitute`ProgramGames`FiniteStateMachineClassify",
+          "WolframInstitute`ProgramGames`FiniteStateMachineMaxIndex",
           "WolframInstitute`ProgramGames`FiniteStateMachineTournament",
           "WolframInstitute`ProgramGames`ProgramTournament",
           "WolframInstitute`ProgramGames`SpaceSurveyTable",
