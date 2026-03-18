@@ -1,3 +1,8 @@
+// The bin target re-includes gpu/strategy/tournament modules that are also
+// compiled for the cdylib. Functions only used via FFI (WolframLink) are
+// expected dead code from the CLI's perspective.
+#![allow(dead_code, unused_variables)]
+
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 use serde::Serialize;

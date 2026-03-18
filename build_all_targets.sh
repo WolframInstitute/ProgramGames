@@ -16,6 +16,16 @@ TARGETS=(
     "Windows-x86-64:x86_64-pc-windows-gnu:--no-default-features"
 )
 
+# Install a dummy xcrun so rustc doesn't warn about missing macOS SDK
+# when cross-compiling for darwin targets from Linux.
+if ! command -v xcrun &> /dev/null; then
+    cat > /usr/local/bin/xcrun << 'XCRUN'
+#!/bin/bash
+echo "/opt/macos-sysroot"
+XCRUN
+    chmod +x /usr/local/bin/xcrun
+fi
+
 echo "Building program-games for all targets..."
 echo
 
