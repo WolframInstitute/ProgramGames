@@ -48,6 +48,15 @@ pub enum StrategySpec {
         #[serde(default = "default_num_actions")]
         num_actions: u8,
     },
+    #[serde(rename = "rule_array")]
+    RuleArray {
+        rules: Vec<u8>,
+        k: u8,
+        r: f32,
+        t: u32,
+        #[serde(default = "default_num_actions")]
+        num_actions: u8,
+    },
 }
 
 impl StrategySpec {
@@ -57,6 +66,14 @@ impl StrategySpec {
             StrategySpec::Tm { id, s, k, .. } => format!("tm({},{})#{}", s, k, id),
             StrategySpec::Fsm { id, s, k, .. } => format!("fsm({},{})#{}", s, k, id),
             StrategySpec::Ca { rule, k, r, t, .. } => format!("ca({},{},{})#{}", k, r, t, rule),
+            StrategySpec::RuleArray { rules, k, r, t, .. } => {
+                let rules_str: String = rules.iter().take(4).map(|r| r.to_string()).collect::<Vec<_>>().join(",");
+                if rules.len() > 4 {
+                    format!("ra({},{},{})#[{},..]", k, r, t, rules_str)
+                } else {
+                    format!("ra({},{},{})#[{}]", k, r, t, rules_str)
+                }
+            }
         }
     }
 }
@@ -88,6 +105,13 @@ enum RunnerInner {
     },
     Ca {
         rule_table: Vec<u8>,
+        k: u8,
+        two_r: u32,
+        t: u32,
+        num_actions: u8,
+    },
+    RuleArray {
+        rule_tables: Vec<Vec<u8>>,
         k: u8,
         two_r: u32,
         t: u32,
@@ -130,6 +154,19 @@ impl StrategyRunner {
                 let rule_table = decode_ca_rule_table(*rule, *k, two_r);
                 RunnerInner::Ca {
                     rule_table,
+                    k: *k,
+                    two_r,
+                    t: *t,
+                    num_actions: *num_actions,
+                }
+            }
+            StrategySpec::RuleArray { rules, k, r, t, num_actions } => {
+                let two_r = (2.0 * r).round() as u32;
+                let rule_tables = rules.iter()
+                    .map(|&rule| decode_ca_rule_table(rule as u64, *k, two_r))
+                    .collect();
+                RunnerInner::RuleArray {
+                    rule_tables,
                     k: *k,
                     two_r,
                     t: *t,
@@ -228,6 +265,18 @@ impl StrategyRunner {
                 }
                 Some(ca_move(rule_table, *k, *two_r, *t, history, *num_actions))
             }
+            RunnerInner::RuleArray {
+                rule_tables,
+                k,
+                two_r,
+                t,
+                num_actions,
+            } => {
+                if round == 0 {
+                    return Some(0);
+                }
+                Some(rule_array_move(rule_tables, *k, *two_r, *t, history, *num_actions))
+            }
         }
     }
 
@@ -273,6 +322,9 @@ impl StrategyRunner {
             }
             RunnerInner::Ca { .. } => {
                 // CAs are stateless (they read the full history each round)
+            }
+            RunnerInner::RuleArray { .. } => {
+                // RuleArrays are stateless (they read the full history each round)
             }
         }
     }
@@ -425,6 +477,70 @@ pub fn ca_move(rule_table: &[u8], k: u8, two_r: u32, t: u32, history_bits: &[u8]
         0
     } else {
         last_row[last_row.len() - 1] % num_actions
+    }
+}
+
+/// Compute a RuleArray strategy's move from game history bits.
+/// Applies an inhomogeneous CA: each step uses a different rule table.
+/// Uses periodic boundaries (constant width, unlike shrinking CA).
+/// For r=1/2 (two_r=1): alternating neighborhood
+///   step 0 (1-indexed step 1, odd): (center, right)
+///   step 1 (1-indexed step 2, even): (left, center)
+/// For r=1 (two_r=2): full (left, center, right) neighborhood
+pub fn rule_array_move(
+    rule_tables: &[Vec<u8>],
+    k: u8,
+    two_r: u32,
+    t: u32,
+    history_bits: &[u8],
+    num_actions: u8,
+) -> u8 {
+    if history_bits.is_empty() {
+        return 0;
+    }
+
+    let width = history_bits.len();
+    let k_usize = k.max(2) as usize;
+
+    let mut row: Vec<u8> = history_bits.to_vec();
+
+    for step in 0..t.min(rule_tables.len() as u32) {
+        let rule_table = &rule_tables[step as usize];
+        let mut next_row = vec![0u8; width];
+
+        for j in 0..width {
+            let left = row[(j + width - 1) % width];
+            let center = row[j];
+            let right = row[(j + 1) % width];
+
+            let input = if two_r == 1 {
+                // r=1/2: alternating neighborhood
+                if (step + 1) % 2 == 1 {
+                    // odd step (1-indexed): (center, right)
+                    (center as usize) * k_usize + right as usize
+                } else {
+                    // even step (1-indexed): (left, center)
+                    (left as usize) * k_usize + center as usize
+                }
+            } else if two_r == 2 {
+                // r=1: full (left, center, right) neighborhood
+                (left as usize) * k_usize * k_usize + (center as usize) * k_usize + right as usize
+            } else {
+                // General case: fallback to center only
+                (center as usize) % rule_table.len()
+            };
+
+            next_row[j] = rule_table.get(input).copied().unwrap_or(0);
+        }
+
+        row = next_row;
+    }
+
+    // Return last cell of final state, like ca_move
+    if row.is_empty() {
+        0
+    } else {
+        row[row.len() - 1] % num_actions
     }
 }
 

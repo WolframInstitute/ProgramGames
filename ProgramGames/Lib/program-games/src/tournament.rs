@@ -535,7 +535,8 @@ pub fn run_mixed_tournament_cpu(
         match spec {
             StrategySpec::Ca { num_actions, .. }
             | StrategySpec::Tm { num_actions, .. }
-            | StrategySpec::Fsm { num_actions, .. } => {
+            | StrategySpec::Fsm { num_actions, .. }
+            | StrategySpec::RuleArray { num_actions, .. } => {
                 *num_actions = payoff.num_actions as u8;
             }
         }

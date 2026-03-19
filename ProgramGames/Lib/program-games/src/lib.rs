@@ -826,6 +826,75 @@ fn run_ca_tournament_cpu(
     matrix
 }
 
+/// Run a RuleArray tournament (CPU only).
+/// Each rule array is a sequence of CA rule numbers applied step-by-step (inhomogeneous CA).
+/// `rule_arrays_json` is a JSON array of arrays: [[r0,r1,...], [r0,r1,...], ...]
+#[wll::export]
+pub fn rule_array_tournament_wl(
+    k: i64,
+    r_numer: i64,
+    r_denom: i64,
+    t: i64,
+    rounds: i64,
+    game: String,
+    rule_arrays_json: String,
+    _use_gpu: bool,
+) -> String {
+    let k = k as u8;
+    let r_f = r_numer as f32 / r_denom as f32;
+    let t = t as u32;
+    let rounds = rounds as u32;
+
+    let dyn_payoff = match tournament::parse_game_dyn(&game) {
+        Ok(p) => p,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    let num_actions = dyn_payoff.num_actions as u8;
+
+    let rule_arrays: Vec<Vec<u8>> = match serde_json::from_str(&rule_arrays_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if rule_arrays.is_empty() {
+        return "{\"error\":\"no rule arrays provided\"}".to_string();
+    }
+
+    let specs: Vec<strategy::StrategySpec> = rule_arrays
+        .iter()
+        .map(|rules| strategy::StrategySpec::RuleArray {
+            rules: rules.clone(),
+            k,
+            r: r_f,
+            t,
+            num_actions,
+        })
+        .collect();
+
+    let n = specs.len();
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (0..n).filter(move |&j| i != j).map(move |j| (i, j)))
+        .collect();
+
+    let pair_scores: Vec<(usize, usize, i64)> = pairs
+        .into_par_iter()
+        .map(|(i, j)| {
+            let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
+            let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
+            let (result, _) = strategy::play_game_dyn(&mut runner_a, &mut runner_b, rounds, &dyn_payoff);
+            let score_a = result.map(|(sa, _)| sa).unwrap_or(0);
+            (i, j, score_a)
+        })
+        .collect();
+
+    let mut scores = vec![vec![0i64; n]; n];
+    for (i, j, score) in pair_scores {
+        scores[i][j] = score;
+    }
+
+    let output = tournament::build_mixed_output(&specs, scores, rounds, &game);
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Classify CA rules by behavioral equivalence. Returns JSON with groups.
 /// sample=0 means exhaustive (all rules), sample>0 means random sample of that size.
 /// Uses Metal GPU when available, falls back to CPU (Rayon).

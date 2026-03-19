@@ -14,6 +14,9 @@ PackageExport["ProgramTournament"]
 PackageExport["PayoffToString"]
 PackageExport["StrategyToJSON"]
 
+PackageScope["iParseLabel"]
+PackageScope["iParsePairwise"]
+
 
 (* ::Section::Closed:: *)
 (*Usage Messages*)
@@ -62,6 +65,9 @@ StrategyToJSON[{"FSM", id_Integer, s_Integer, k_Integer}] :=
 StrategyToJSON[{"CA", rule_Integer, k_Integer, r_, t_Integer}] :=
 	ExportString[<|"type" -> "ca", "rule" -> rule, "k" -> k,
 		"r" -> N[r], "t" -> t|>, "RawJSON", "Compact" -> True]
+StrategyToJSON[{"RA", rules_List, k_Integer, r_, t_Integer}] :=
+	ExportString[<|"type" -> "rule_array", "rules" -> rules, "k" -> k,
+		"r" -> N[r], "t" -> t|>, "RawJSON", "Compact" -> True]
 StrategyToJSON[{id_Integer, s_Integer, k_Integer}] :=
 	StrategyToJSON[{"TM", id, s, k}]
 
@@ -87,6 +93,12 @@ iParseLabel[label_String] := Which[
 		With[{parts = StringCases[label,
 			"ca(" ~~ Shortest[k__] ~~ "," ~~ Shortest[r__] ~~ "," ~~ Shortest[t__] ~~ ")#" ~~ rule__ :>
 				{"CA", {ToExpression[rule], ToExpression[k], Rationalize[ToExpression[r]]}}]},
+			If[Length[parts] > 0, First[parts], label]
+		],
+	StringMatchQ[label, "ra(" ~~ __ ~~ ")#" ~~ __],
+		With[{parts = StringCases[label,
+			"ra(" ~~ __ ~~ ")#[" ~~ Shortest[rules__] ~~ "]" :>
+				{"RA", ToExpression["{" <> rules <> "}"]}]},
 			If[Length[parts] > 0, First[parts], label]
 		],
 	True, label

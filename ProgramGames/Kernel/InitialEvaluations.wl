@@ -33,6 +33,7 @@ PackageScope["CAClassifyWL"]
 PackageScope["CATournamentWL"]
 PackageScope["FSMClassifyWL"]
 PackageScope["FSMTournamentWL"]
+PackageScope["RuleArrayTournamentWL"]
 
 
 (* ::Section::Closed:: *)
@@ -61,7 +62,8 @@ $ProgramGamesRequiredFunctionNames = {
 	"ca_classify_wl",
 	"ca_tournament_wl",
 	"fsm_classify_wl",
-	"fsm_tournament_wl"
+	"fsm_tournament_wl",
+	"rule_array_tournament_wl"
 };
 
 iMissingFunctionNames[funcs_Association] :=
@@ -212,3 +214,4 @@ CAClassifyWL := functions["ca_classify_wl"]
 CATournamentWL := functions["ca_tournament_wl"]
 FSMClassifyWL := functions["fsm_classify_wl"]
 FSMTournamentWL := functions["fsm_tournament_wl"]
+RuleArrayTournamentWL := functions["rule_array_tournament_wl"]
