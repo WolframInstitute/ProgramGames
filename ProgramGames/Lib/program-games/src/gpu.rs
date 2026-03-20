@@ -71,12 +71,24 @@ struct GpuTransition {
 // Apple Silicon supports ~16KB per-thread stack; 11000 bytes is safe.
 #define MAX_TAPE 11000
 
+// Atomic max via CAS loop (Metal lacks atomic_fetch_max for uint)
+void atomic_max_uint(device atomic_uint* ptr, uint val) {
+    uint old = atomic_load_explicit(ptr, memory_order_relaxed);
+    while (val > old) {
+        if (atomic_compare_exchange_weak_explicit(ptr, &old, val,
+            memory_order_relaxed, memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
 kernel void tm_halting_test(
     device const GpuTransition* all_transitions [[buffer(0)]],
     device const uint* inputs             [[buffer(1)]],
     device atomic_uint* halted_flags      [[buffer(2)]],
     constant GpuParams& params            [[buffer(3)]],
     device const uint* step_limits        [[buffer(4)]],
+    device atomic_uint* worst_steps       [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
 {
     // gid encodes (tm_idx * num_inputs + input_idx)
@@ -126,6 +138,7 @@ kernel void tm_halting_test(
     uint head = tape_right - 1;
     uint state = 1; // start state (1-indexed)
     bool did_halt = false;
+    uint final_step = my_max_steps;
 
     for (uint step = 0; step < my_max_steps; step++) {
         uchar read_sym = tape[head];
@@ -137,6 +150,7 @@ kernel void tm_halting_test(
         if (t.move_right != 0u) {
             if (head + 1 == tape_right) {
                 did_halt = true;
+                final_step = step + 1;
                 break;
             }
             head++;
@@ -154,6 +168,8 @@ kernel void tm_halting_test(
 
     if (!did_halt) {
         atomic_fetch_or_explicit(&halted_flags[tm_idx], 1u, memory_order_relaxed);
+    } else {
+        atomic_max_uint(&worst_steps[tm_idx], final_step);
     }
 }
 "#;
@@ -403,6 +419,19 @@ kernel void tm_tournament(
                 );
             }
 
+            // worst_steps: one u32 per TM, tracks max steps among halting threads
+            let worst_steps_buf = self.device.new_buffer(
+                (num_tms.max(1) * size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::write_bytes(
+                    worst_steps_buf.contents() as *mut u8,
+                    0,
+                    num_tms * size_of::<u32>(),
+                );
+            }
+
             // Dispatch
             let total_threads = num_tms * num_inputs;
             let cmd_buf = self.queue.new_command_buffer();
@@ -417,6 +446,7 @@ kernel void tm_tournament(
                 (&params as *const GpuParams).cast(),
             );
             encoder.set_buffer(4, Some(&limits_buf), 0);
+            encoder.set_buffer(5, Some(&worst_steps_buf), 0);
 
             let width = self.pipeline.thread_execution_width().max(1);
             let threads_per_group = MTLSize::new(width, 1, 1);
@@ -436,6 +466,104 @@ kernel void tm_tournament(
                 std::slice::from_raw_parts(ptr, num_tms)
             };
             Ok(flags.iter().map(|&f| f == 0).collect())
+        }
+
+        /// Like test_batch, but also returns per-TM worst_steps (max step count
+        /// among halting inputs). Used by GPU-first search for adaptive depth.
+        pub fn test_batch_with_steps(
+            &self,
+            transitions: &[Vec<super::super::TmTransition>],
+            inputs: &[u64],
+            states: u16,
+            symbols: u8,
+            max_steps: u32,
+            input_width: u32,
+            per_tm_step_limits: &[u32],
+        ) -> Result<(Vec<bool>, Vec<u32>), String> {
+            let num_tms = transitions.len();
+            let num_inputs = inputs.len();
+            if num_tms == 0 || num_inputs == 0 {
+                return Ok((vec![true; num_tms], vec![0; num_tms]));
+            }
+
+            let gpu_trans: Vec<GpuTransition> = transitions
+                .iter()
+                .flat_map(|tm| {
+                    tm.iter().map(|t| GpuTransition {
+                        write: t.write as u32,
+                        move_right: if t.move_right { 1 } else { 0 },
+                        next: t.next as u32,
+                        _pad: 0,
+                    })
+                })
+                .collect();
+
+            let gpu_inputs: Vec<u32> = inputs.iter().map(|&v| v as u32).collect();
+
+            let params = GpuParams {
+                num_tms: num_tms as u32,
+                states: states as u32,
+                symbols: symbols as u32,
+                max_steps,
+                num_inputs: num_inputs as u32,
+                input_width,
+            };
+
+            let trans_buf = self.buf_from_slice(&gpu_trans);
+            let input_buf = self.buf_from_slice(&gpu_inputs);
+            let limits_buf = self.buf_from_slice(per_tm_step_limits);
+            let flags_buf = self.device.new_buffer(
+                (num_tms.max(1) * size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let worst_steps_buf = self.device.new_buffer(
+                (num_tms.max(1) * size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::write_bytes(flags_buf.contents() as *mut u8, 0, num_tms * size_of::<u32>());
+                std::ptr::write_bytes(worst_steps_buf.contents() as *mut u8, 0, num_tms * size_of::<u32>());
+            }
+
+            let total_threads = num_tms * num_inputs;
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&trans_buf), 0);
+            encoder.set_buffer(1, Some(&input_buf), 0);
+            encoder.set_buffer(2, Some(&flags_buf), 0);
+            encoder.set_bytes(
+                3,
+                size_of::<GpuParams>() as u64,
+                (&params as *const GpuParams).cast(),
+            );
+            encoder.set_buffer(4, Some(&limits_buf), 0);
+            encoder.set_buffer(5, Some(&worst_steps_buf), 0);
+
+            let width = self.pipeline.thread_execution_width().max(1);
+            let threads_per_group = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (total_threads as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            encoder.dispatch_thread_groups(groups, threads_per_group);
+            encoder.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+
+            let flags = unsafe {
+                let ptr = flags_buf.contents() as *const u32;
+                std::slice::from_raw_parts(ptr, num_tms)
+            };
+            let steps = unsafe {
+                let ptr = worst_steps_buf.contents() as *const u32;
+                std::slice::from_raw_parts(ptr, num_tms)
+            };
+            Ok((
+                flags.iter().map(|&f| f == 0).collect(),
+                steps.to_vec(),
+            ))
         }
 
         fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
@@ -1142,6 +1270,237 @@ kernel void ca_classify(
         }
     }
 
+    // ── TM Classification on Metal ────────────────────────────────────
+
+    const TM_CLASSIFY_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GpuTransition {
+    uint write;
+    uint move_right;
+    uint next;
+    uint _pad;
+};
+
+struct TmClassifyParams {
+    uint num_tms;
+    uint states;
+    uint symbols;
+    uint max_steps;
+    uint depth;
+    uint sig_len;
+};
+
+#define CLASSIFY_MAX_TAPE 6000
+
+kernel void tm_classify(
+    device const GpuTransition* all_transitions [[buffer(0)]],
+    device uchar* signatures                    [[buffer(1)]],
+    constant TmClassifyParams& params           [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.num_tms) return;
+
+    uint k = params.symbols;
+    uint trans_per_tm = params.states * k;
+    device const GpuTransition* trans = all_transitions + gid * trans_per_tm;
+
+    ulong sig_offset = (ulong)gid * (ulong)params.sig_len;
+    device uchar* my_sig = signatures + sig_offset;
+    uint sig_idx = 0;
+
+    uchar tape[CLASSIFY_MAX_TAPE];
+
+    for (uint r = 1; r <= params.depth; r++) {
+        uint input_width = 2 * r;
+        uint num_inputs = 1;
+        for (uint i = 0; i < input_width; i++) num_inputs *= k;
+
+        uint left_pad = min(params.max_steps, (uint)(CLASSIFY_MAX_TAPE - input_width - 1));
+        uint tape_right = left_pad + input_width;
+
+        for (uint input_val = 0; input_val < num_inputs; input_val++) {
+            // Zero tape
+            for (uint i = 0; i < tape_right; i++) tape[i] = 0;
+
+            // Decode input digits (MSD-first)
+            if (k == 2) {
+                for (uint i = 0; i < input_width; i++) {
+                    tape[left_pad + i] = (input_val >> (input_width - 1 - i)) & 1u;
+                }
+            } else {
+                uint tmp = input_val;
+                for (uint i = input_width; i > 0; i--) {
+                    tape[left_pad + i - 1] = tmp % k;
+                    tmp /= k;
+                }
+            }
+
+            // Run TM
+            uint head = tape_right - 1;
+            uint state = 1;
+            uchar output = 1; // default: non-halting
+
+            for (uint step = 0; step < params.max_steps; step++) {
+                uchar read_sym = tape[head];
+                uint idx = (state - 1) * k + read_sym;
+                GpuTransition t = trans[idx];
+
+                tape[head] = (uchar)t.write;
+
+                if (t.move_right != 0u) {
+                    if (head + 1 == tape_right) {
+                        output = tape[tape_right - 1] % 2;
+                        break;
+                    }
+                    head++;
+                } else {
+                    if (head == 0) break;
+                    head--;
+                }
+
+                state = t.next;
+                if (state == 0u) break;
+            }
+
+            my_sig[sig_idx++] = output;
+        }
+    }
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct TmClassifyParams {
+        num_tms: u32,
+        states: u32,
+        symbols: u32,
+        max_steps: u32,
+        depth: u32,
+        sig_len: u32,
+    }
+
+    pub struct MetalTmClassifier {
+        device: Device,
+        queue: CommandQueue,
+        pipeline: ComputePipelineState,
+    }
+
+    impl MetalTmClassifier {
+        pub fn new() -> Result<Self, String> {
+            let device =
+                Device::system_default().ok_or("Metal device unavailable")?;
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(TM_CLASSIFY_SHADER, &options)
+                .map_err(|e| format!("Metal TM classify shader compile: {e}"))?;
+            let func = library
+                .get_function("tm_classify", None)
+                .map_err(|e| format!("Metal TM classify function: {e}"))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("Metal TM classify pipeline: {e}"))?;
+            let queue = device.new_command_queue();
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+            })
+        }
+
+        /// Classify a batch of TMs on GPU. Returns flat signature buffer.
+        /// Each TM gets `sig_len` bytes of signature data.
+        pub fn classify_batch(
+            &self,
+            transitions: &[Vec<super::super::TmTransition>],
+            states: u16,
+            symbols: u8,
+            max_steps: u32,
+            depth: u32,
+        ) -> Result<Vec<u8>, String> {
+            let num_tms = transitions.len();
+            let sig_len = super::compute_tm_sig_len(symbols, depth);
+            if num_tms == 0 {
+                return Ok(vec![]);
+            }
+
+            // Flatten transitions into GPU format
+            let gpu_trans: Vec<GpuTransition> = transitions
+                .iter()
+                .flat_map(|tm| {
+                    tm.iter().map(|t| GpuTransition {
+                        write: t.write as u32,
+                        move_right: if t.move_right { 1 } else { 0 },
+                        next: t.next as u32,
+                        _pad: 0,
+                    })
+                })
+                .collect();
+
+            let params = TmClassifyParams {
+                num_tms: num_tms as u32,
+                states: states as u32,
+                symbols: symbols as u32,
+                max_steps,
+                depth,
+                sig_len: sig_len as u32,
+            };
+
+            let trans_buf = self.buf_from_slice(&gpu_trans);
+            let buf_bytes = (num_tms * sig_len).max(4);
+            let sig_buf = self.device.new_buffer(
+                buf_bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&trans_buf), 0);
+            encoder.set_buffer(1, Some(&sig_buf), 0);
+            encoder.set_bytes(
+                2,
+                size_of::<TmClassifyParams>() as u64,
+                (&params as *const TmClassifyParams).cast(),
+            );
+
+            let width = self.pipeline.thread_execution_width().max(1);
+            let threads_per_group = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (num_tms as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            encoder.dispatch_thread_groups(groups, threads_per_group);
+            encoder.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+
+            let raw = unsafe {
+                let ptr = sig_buf.contents() as *const u8;
+                std::slice::from_raw_parts(ptr, num_tms * sig_len)
+            };
+
+            Ok(raw.to_vec())
+        }
+
+        fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
+            if slice.is_empty() {
+                return self.device.new_buffer(
+                    4,
+                    MTLResourceOptions::StorageModeShared,
+                );
+            }
+            let len = (slice.len() * size_of::<T>()) as u64;
+            self.device.new_buffer_with_data(
+                slice.as_ptr() as *const c_void,
+                len,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+    }
+
     // ── FSM Tournament on Metal ────────────────────────────────────────
 
     /// Build the FSM tournament shader source with the correct MAX_STATES define.
@@ -1517,6 +1876,61 @@ pub fn classify_ca_gpu(
 }
 
 /// Compute the total signature length for CA classification at a given depth.
+/// Compute TM classification signature length for given symbols and depth.
+/// sig_len = sum over r=1..=depth of k^(2*r)
+pub fn compute_tm_sig_len(symbols: u8, depth: u32) -> usize {
+    let k = symbols as u64;
+    let mut len = 0usize;
+    for r in 1..=depth {
+        len += k.pow(2 * r) as usize;
+    }
+    len
+}
+
+/// Classify TMs by behavioral signature on GPU. Returns (flat_signatures, sig_len).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn classify_tm_gpu(
+    tm_ids: &[u64],
+    states: u16,
+    symbols: u8,
+    max_steps: u32,
+    depth: u32,
+) -> Result<(Vec<u8>, usize), String> {
+    let gpu = metal_impl::MetalTmClassifier::new()?;
+    let sig_len = compute_tm_sig_len(symbols, depth);
+    // Batch size based on GPU memory: aim for ~512MB signature buffer.
+    // k=2 sig_len=340: 512MB/340 ≈ 1.5M TMs per batch (process all at once).
+    // k=3 sig_len=7380: 512MB/7380 ≈ 69K TMs per batch.
+    let batch_size = (512 * 1024 * 1024 / sig_len).max(1024);
+    let n = tm_ids.len();
+    let mut flat_sigs = vec![0u8; n * sig_len];
+
+    for batch_start in (0..n).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(n);
+        let batch_trans: Vec<Vec<super::TmTransition>> = tm_ids[batch_start..batch_end]
+            .iter()
+            .map(|&id| super::decode_tm(id, states, symbols))
+            .collect();
+
+        let batch_sigs = gpu.classify_batch(&batch_trans, states, symbols, max_steps, depth)?;
+        flat_sigs[batch_start * sig_len..batch_end * sig_len]
+            .copy_from_slice(&batch_sigs);
+    }
+
+    Ok((flat_sigs, sig_len))
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn classify_tm_gpu(
+    _tm_ids: &[u64],
+    _states: u16,
+    _symbols: u8,
+    _max_steps: u32,
+    _depth: u32,
+) -> Result<(Vec<u8>, usize), String> {
+    Err("Metal not available".to_string())
+}
+
 pub fn compute_ca_sig_len(depth: u32) -> u32 {
     let mut len = 0u32;
     for history_len in 0..=(depth * 2) {

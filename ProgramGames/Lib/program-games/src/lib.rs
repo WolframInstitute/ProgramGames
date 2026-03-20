@@ -248,7 +248,7 @@ pub struct GroupEntry {
 // ── GPU-accelerated search ───────────────────────────────────────────────
 
 /// Run the halting search using Metal GPU + CPU adaptive depth.
-/// Phase 1 (CPU): depth 1-4, adaptive skip.
+/// Phase 1 (CPU): depth 1-4, adaptive skip, using pre-padded tape.
 /// Phase 2 (GPU): for remaining TMs, dispatch per-depth batches.
 /// Falls back to CPU-only if GPU init fails.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -271,7 +271,8 @@ pub fn search_gpu(
     let k = symbols as u64;
     let gpu_max_steps = max_steps.min(10000); // GPU tape limit (MAX_TAPE=11000)
 
-    // Phase 1 (CPU): test all TMs at depth 1-4, record worst_steps
+    // Phase 1 (CPU): test all TMs at depth 1-4, record worst_steps.
+    // Uses pre-padded tape to avoid O(n) Vec::insert.
     eprintln!("  GPU phase 1: CPU depth 1-4 filter...");
     struct TmState {
         id: u64,
@@ -286,14 +287,48 @@ pub fn search_gpu(
             let transitions = decode_tm(id, states, symbols);
             let mut worst = 0u32;
             let mut alive = true;
+            let tape_cap = max_steps as usize + 20;
+            let mut tape = vec![0u8; tape_cap];
             for r in 1..=depth.min(4) {
                 if r > 1 && worst + 1 <= (2 * (r - 1)) as u32 {
-                    // suffix-complete
                     break;
                 }
                 let max_input = k.checked_pow(2 * r).unwrap_or(u64::MAX);
+                let input_width = (2 * r) as usize;
+                let left_pad = tape_cap - input_width;
                 for input in 0..max_input {
-                    let (halted, _, steps) = run_tm(&transitions, symbols, input, max_steps);
+                    // Clear and setup tape
+                    for b in tape[..tape_cap].iter_mut() { *b = 0; }
+                    let mut val = input;
+                    for i in (0..input_width).rev() {
+                        tape[left_pad + i] = (val % k) as u8;
+                        val /= k;
+                    }
+                    // Run TM with pre-padded tape
+                    let mut head = tape_cap - 1;
+                    let mut state: u16 = 1;
+                    let mut halted = false;
+                    let mut steps = 0u32;
+                    for step in 0..max_steps {
+                        let read = tape[head];
+                        let idx = (state as usize - 1) * (symbols as usize) + (read as usize);
+                        let t = transitions[idx];
+                        tape[head] = t.write;
+                        if t.move_right {
+                            if head + 1 == tape_cap {
+                                halted = true;
+                                steps = step + 1;
+                                break;
+                            }
+                            head += 1;
+                        } else if head == 0 {
+                            break;
+                        } else {
+                            head -= 1;
+                        }
+                        state = t.next;
+                        if state == 0 { break; }
+                    }
                     if !halted {
                         alive = false;
                         break;
@@ -416,32 +451,56 @@ pub fn search_cpu(
 // ── Classify logic ──────────────────────────────────────────────────────────
 
 /// Classify TMs by behavior: group machines that produce identical outputs.
-/// Returns a ClassifyOutput struct.
+/// Returns a ClassifyOutput struct. When `use_gpu` is true, tries Metal GPU
+/// acceleration. GPU is used for k=2 (sig_len=340, lightweight threads);
+/// CPU is preferred for k≥3 (sig_len≥7380, heavy per-thread work).
 pub fn classify(
     tm_ids: &[u64],
     states: u16,
     symbols: u8,
     max_steps: u32,
     depth: u32,
+    use_gpu: bool,
 ) -> ClassifyOutput {
     let classify_depth = depth.min(4);
-    let k = symbols as u64;
+    let sig_len = gpu::compute_tm_sig_len(symbols, classify_depth);
 
-    let signatures: Vec<(u64, Vec<u8>)> = tm_ids
-        .par_iter()
-        .map(|&id| {
-            let trans = decode_tm(id, states, symbols);
-            let mut sig = Vec::new();
-            for r in 1..=classify_depth {
-                let max_input = k.pow(2 * r);
-                for input in 0..max_input {
-                    let (halted, out, _) = run_tm(&trans, symbols, input, max_steps);
-                    sig.push(if halted { out } else { 1 });
+    // GPU is beneficial when per-thread work is lightweight (small sig_len).
+    // For k≥3, sig_len≥7380 and each thread does thousands of TM runs,
+    // which causes register spilling and poor GPU occupancy.
+    let gpu_worthwhile = use_gpu && sig_len <= 1000;
+
+    // Try GPU classification
+    let signatures: Vec<(u64, Vec<u8>)>;
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if gpu_worthwhile {
+            match gpu::classify_tm_gpu(tm_ids, states, symbols, max_steps, classify_depth) {
+                Ok((flat_sigs, sl)) => {
+                    eprintln!("  GPU classify: {} TMs, sig_len={}", tm_ids.len(), sl);
+                    signatures = tm_ids.iter().enumerate().map(|(i, &id)| {
+                        let start = i * sl;
+                        let sig = flat_sigs[start..start + sl].to_vec();
+                        (id, sig)
+                    }).collect();
+                }
+                Err(e) => {
+                    eprintln!("  GPU classify failed ({}), falling back to CPU", e);
+                    signatures = classify_cpu_signatures(tm_ids, states, symbols, max_steps, classify_depth);
                 }
             }
-            (id, sig)
-        })
-        .collect();
+        } else {
+            signatures = classify_cpu_signatures(tm_ids, states, symbols, max_steps, classify_depth);
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = use_gpu;
+        let _ = sig_len;
+        let _ = gpu_worthwhile;
+        signatures = classify_cpu_signatures(tm_ids, states, symbols, max_steps, classify_depth);
+    }
 
     // Group by signature
     use std::collections::HashMap;
@@ -485,6 +544,66 @@ pub fn classify(
             })
             .collect(),
     }
+}
+
+/// CPU classification: compute behavioral signatures using optimized pre-padded tape.
+fn classify_cpu_signatures(
+    tm_ids: &[u64],
+    states: u16,
+    symbols: u8,
+    max_steps: u32,
+    classify_depth: u32,
+) -> Vec<(u64, Vec<u8>)> {
+    let k = symbols as u64;
+    tm_ids
+        .par_iter()
+        .map(|&id| {
+            let trans = decode_tm(id, states, symbols);
+            let tape_cap = max_steps as usize + 20;
+            let mut tape = vec![0u8; tape_cap];
+            let mut sig = Vec::new();
+            for r in 1..=classify_depth {
+                let max_input = k.pow(2 * r);
+                let input_width = (2 * r) as usize;
+                let left_pad = tape_cap - input_width;
+                for input in 0..max_input {
+                    // Clear dirty region (full clear for correctness)
+                    for b in tape[..tape_cap].iter_mut() { *b = 0; }
+                    // Decode input digits
+                    let mut val = input;
+                    for i in (0..input_width).rev() {
+                        tape[left_pad + i] = (val % k) as u8;
+                        val /= k;
+                    }
+                    // Run TM with pre-padded tape
+                    let mut head = tape_cap - 1;
+                    let mut state: u16 = 1;
+                    let mut output = 1u8; // non-halting default
+                    for _step in 0..max_steps {
+                        let read = tape[head];
+                        let idx = (state as usize - 1) * (symbols as usize) + (read as usize);
+                        let t = trans[idx];
+                        tape[head] = t.write;
+                        if t.move_right {
+                            if head + 1 == tape_cap {
+                                output = tape[tape_cap - 1] % 2;
+                                break;
+                            }
+                            head += 1;
+                        } else if head == 0 {
+                            break;
+                        } else {
+                            head -= 1;
+                        }
+                        state = t.next;
+                        if state == 0 { break; }
+                    }
+                    sig.push(output);
+                }
+            }
+            (id, sig)
+        })
+        .collect()
 }
 
 // ── WLL exported functions ──────────────────────────────────────────────────
@@ -601,7 +720,7 @@ pub fn tm_classify_wl(
         return "{\"error\":\"invalid tm_ids_json\"}".to_string();
     };
 
-    let output = classify(&ids, states, symbols, max_steps, depth);
+    let output = classify(&ids, states, symbols, max_steps, depth, use_gpu);
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
