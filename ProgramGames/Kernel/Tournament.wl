@@ -123,22 +123,28 @@ Options[TuringMachineTournament] = {
 	"MaxSteps" -> 500,
 	"Rounds" -> 100,
 	"Game" -> "pd",
-	"GPU" -> True
+	"GPU" -> True,
+	"Aggregator" -> "Mean"
 };
 
 TuringMachineTournament[tmIds_List, s_Integer, k_Integer, opts : OptionsPattern[]] :=
-	Module[{gameStr, resultJSON, result},
+	Module[{gameStr, resultJSON, result, agg, ranking},
 		gameStr = PayoffToString[OptionValue["Game"]];
+		agg = OptionValue["Aggregator"];
 		resultJSON = TMTournamentWL[s, k,
 			OptionValue["MaxSteps"], OptionValue["Rounds"],
 			gameStr, ExportString[tmIds, "RawJSON"], TrueQ[OptionValue["GPU"]]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
+		ranking = Switch[agg,
+			"Total", SortBy[result["ranking"], -#["total"] &],
+			_, SortBy[result["ranking"], -#["mean"] &]
+		];
 		<|
 			"IDs" -> result["ids"],
 			"Scores" -> result["scores"],
 			"Pairwise" -> iParsePairwise[result["pairwise"], "id_a", "id_b"],
-			"Ranking" -> result["ranking"],
+			"Ranking" -> ranking,
 			"Rounds" -> result["rounds"],
 			"Game" -> result["game"],
 			"NumMachines" -> result["num_machines"],
@@ -153,23 +159,29 @@ TuringMachineTournament[tmIds_List, s_Integer, k_Integer, opts : OptionsPattern[
 
 Options[ProgramTournament] = {
 	"Rounds" -> 100,
-	"Game" -> "pd"
+	"Game" -> "pd",
+	"Aggregator" -> "Mean"
 };
 
 ProgramTournament[strategies_List, opts : OptionsPattern[]] :=
-	Module[{ndjson, gameStr, resultJSON, result},
+	Module[{ndjson, gameStr, resultJSON, result, agg, ranking},
 		ndjson = StringRiffle[StrategyToJSON /@ strategies, "\n"];
 		gameStr = PayoffToString[OptionValue["Game"]];
+		agg = OptionValue["Aggregator"];
 		resultJSON = ProgramTournamentWL[
 			OptionValue["Rounds"], gameStr, ndjson];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
+		ranking = Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]];
+		ranking = Switch[agg,
+			"Total", SortBy[ranking, -#["total"] &],
+			_, SortBy[ranking, -#["mean"] &]
+		];
 		<|
 			"Strategies" -> (iParseLabel /@ result["strategies"]),
-			"Labels" -> (iParseLabel /@ Lookup[result["ranking"], "label"]),
 			"Scores" -> result["scores"],
 			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b", iParseLabel],
-			"Ranking" -> Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]],
+			"Ranking" -> ranking,
 			"Rounds" -> result["rounds"],
 			"Game" -> result["game"],
 			"NumStrategies" -> result["num_strategies"],
@@ -184,13 +196,15 @@ ProgramTournament[strategies_List, opts : OptionsPattern[]] :=
 
 Options[CellularAutomatonTournament] = {
 	"Colors" -> 2, "Radius" -> 1, "Steps" -> 10,
-	"Rounds" -> 100, "Game" -> "pd", "GPU" -> True
+	"Rounds" -> 100, "Game" -> "pd", "GPU" -> True,
+	"Aggregator" -> "Mean"
 };
 
 CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
-	Module[{k, r, rNum, rDen, gameStr, resultJSON, result},
+	Module[{k, r, rNum, rDen, gameStr, resultJSON, result, agg, ranking},
 		k = OptionValue["Colors"];
 		r = OptionValue["Radius"];
+		agg = OptionValue["Aggregator"];
 		{rNum, rDen} = If[IntegerQ[r], {r, 1}, Through[{Numerator, Denominator}[r]]];
 		gameStr = PayoffToString[OptionValue["Game"]];
 		resultJSON = CATournamentWL[k, rNum, rDen,
@@ -199,12 +213,16 @@ CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
 			TrueQ[OptionValue["GPU"]]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
+		ranking = Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]];
+		ranking = Switch[agg,
+			"Total", SortBy[ranking, -#["total"] &],
+			_, SortBy[ranking, -#["mean"] &]
+		];
 		<|
 			"Strategies" -> (iParseLabel /@ result["strategies"]),
-			"Labels" -> (iParseLabel /@ Lookup[result["ranking"], "label"]),
 			"Scores" -> result["scores"],
 			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b", iParseLabel],
-			"Ranking" -> Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]],
+			"Ranking" -> ranking,
 			"Rounds" -> result["rounds"],
 			"Game" -> result["game"],
 			"NumStrategies" -> result["num_strategies"],
@@ -220,13 +238,15 @@ CellularAutomatonTournament[caRules_List, opts : OptionsPattern[]] :=
 
 Options[FiniteStateMachineTournament] = {
 	"States" -> 2, "Colors" -> 2,
-	"Rounds" -> 100, "Game" -> "pd", "GPU" -> True
+	"Rounds" -> 100, "Game" -> "pd", "GPU" -> True,
+	"Aggregator" -> "Mean"
 };
 
 FiniteStateMachineTournament[fsmIds_List, opts : OptionsPattern[]] :=
-	Module[{s, k, gameStr, resultJSON, result},
+	Module[{s, k, gameStr, resultJSON, result, agg, ranking},
 		s = OptionValue["States"];
 		k = OptionValue["Colors"];
+		agg = OptionValue["Aggregator"];
 		gameStr = PayoffToString[OptionValue["Game"]];
 		resultJSON = FSMTournamentWL[s, k,
 			OptionValue["Rounds"],
@@ -234,12 +254,16 @@ FiniteStateMachineTournament[fsmIds_List, opts : OptionsPattern[]] :=
 			TrueQ[OptionValue["GPU"]]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
+		ranking = Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]];
+		ranking = Switch[agg,
+			"Total", SortBy[ranking, -#["total"] &],
+			_, SortBy[ranking, -#["mean"] &]
+		];
 		<|
 			"Strategies" -> (iParseLabel /@ result["strategies"]),
-			"Labels" -> (iParseLabel /@ Lookup[result["ranking"], "label"]),
 			"Scores" -> result["scores"],
 			"Pairwise" -> iParsePairwise[result["pairwise"], "label_a", "label_b", iParseLabel],
-			"Ranking" -> Map[MapAt[iParseLabel, #, Key["label"]] &, result["ranking"]],
+			"Ranking" -> ranking,
 			"Rounds" -> result["rounds"],
 			"Game" -> result["game"],
 			"NumStrategies" -> result["num_strategies"],

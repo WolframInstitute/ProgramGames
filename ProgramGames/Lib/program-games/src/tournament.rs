@@ -433,8 +433,8 @@ pub struct PairResult {
     pub j: usize,
     pub id_a: u64,
     pub id_b: u64,
-    pub score_a: i64,
-    pub score_b: i64,
+    pub score_a: f64,
+    pub score_b: f64,
 }
 
 #[derive(Serialize)]
@@ -460,6 +460,8 @@ pub fn build_output(
     let n = ids.len();
 
     // Pairwise results (all ordered pairs including self-play)
+    // Mean-aggregated over rounds to match WL TournamentScores convention.
+    let r = rounds as f64;
     let mut pairwise = Vec::with_capacity(n * n);
     for i in 0..n {
         for j in 0..n {
@@ -468,8 +470,8 @@ pub fn build_output(
                 j,
                 id_a: ids[i],
                 id_b: ids[j],
-                score_a: a_scores[i][j],
-                score_b: b_scores[i][j],
+                score_a: a_scores[i][j] as f64 / r,
+                score_b: b_scores[i][j] as f64 / r,
             });
         }
     }
@@ -478,7 +480,6 @@ pub fn build_output(
     // Both perspectives, Mean-aggregated over rounds, 2*n games per player.
     // a_scores[i][j] = player i's payoff as A when i plays A against j as B
     // b_scores[i][j] = player j's payoff as B when i plays A against j as B
-    let r = rounds as f64;
     let mut ranking: Vec<RankEntry> = ids
         .iter()
         .enumerate()
@@ -622,8 +623,8 @@ pub struct MixedPairResult {
     pub j: usize,
     pub label_a: String,
     pub label_b: String,
-    pub score_a: i64,
-    pub score_b: i64,
+    pub score_a: f64,
+    pub score_b: f64,
 }
 
 #[derive(Serialize)]
@@ -741,6 +742,8 @@ pub fn build_mixed_output(
     let labels: Vec<String> = specs.iter().map(|s| s.label()).collect();
 
     // Pairwise results (all ordered pairs including self-play)
+    // Mean-aggregated over rounds to match WL TournamentScores convention.
+    let r = rounds as f64;
     let mut pairwise = Vec::with_capacity(n * n);
     for i in 0..n {
         for j in 0..n {
@@ -749,8 +752,8 @@ pub fn build_mixed_output(
                 j,
                 label_a: labels[i].clone(),
                 label_b: labels[j].clone(),
-                score_a: a_scores[i][j],
-                score_b: b_scores[i][j],
+                score_a: a_scores[i][j] as f64 / r,
+                score_b: b_scores[i][j] as f64 / r,
             });
         }
     }
@@ -760,7 +763,6 @@ pub fn build_mixed_output(
     // b_scores[i][j] = player j's payoff as B when i plays A against j as B
     // Win/loss is determined by Sign(payoff_A - payoff_B) per pair.
     // Each strategy has 2*n games (n as player A, n as player B including self-play).
-    let r = rounds as f64;
     let mut ranking: Vec<MixedRankEntry> = labels
         .iter()
         .enumerate()
