@@ -190,7 +190,15 @@ pub fn test_halting(
             outputs.push((input, out_mod2));
         }
     }
-    Some(outputs)
+    // Only return Some if suffix-complete: the TM reads at most worst_steps+1
+    // cells from the right end, and we tested all patterns of width 2*depth.
+    // If worst_steps+1 > 2*depth, the TM may encounter untested cell patterns
+    // on longer inputs (e.g. during 100-round game play) and fail to halt.
+    if worst_steps + 1 <= (2 * depth) as u32 {
+        Some(outputs)
+    } else {
+        None
+    }
 }
 
 // ── Output structs ──────────────────────────────────────────────────────────
@@ -311,7 +319,11 @@ pub fn search_gpu(
         .collect();
 
     if need_gpu.is_empty() || depth <= 4 {
-        return tms.iter().filter(|t| t.alive).map(|t| t.id).collect();
+        // Only include suffix-complete TMs (guaranteed to halt on all inputs)
+        return tms.iter()
+            .filter(|t| t.alive && t.worst_steps + 1 <= (2 * depth) as u32)
+            .map(|t| t.id)
+            .collect();
     }
 
     // Phase 2 (GPU): test remaining TMs depth-by-depth
@@ -385,7 +397,11 @@ pub fn search_gpu(
         }
     }
 
-    tms.iter().filter(|t| t.alive).map(|t| t.id).collect()
+    // Only include suffix-complete TMs (guaranteed to halt on all inputs)
+    tms.iter()
+        .filter(|t| t.alive && t.worst_steps + 1 <= (2 * depth) as u32)
+        .map(|t| t.id)
+        .collect()
 }
 
 /// CPU-only search (existing logic).
@@ -1390,31 +1406,47 @@ mod tests {
     }
 
     #[test]
-    fn test_halting_tm64_passes() {
-        let trans = decode_tm(64, 2, 2);
+    fn test_halting_suffix_complete_tm() {
+        // TM 576 (2,2): both state-1 transitions move right, so it halts
+        // in exactly 1 step on every input. Suffix-complete at depth 1.
+        let trans = decode_tm(576, 2, 2);
         let result = test_halting(&trans, 2, 500, 4);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().len(), 4 + 16 + 64 + 256);
+        // Adaptive skip at depth 2: worst_steps=1, 1+1<=2*1 → returns depth-1 outputs only
+        assert_eq!(result.unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_halting_tm64_not_suffix_complete() {
+        // TM 64 halts on all small inputs but reads the entire tape,
+        // so worst_steps grows with input size → never suffix-complete.
+        let trans = decode_tm(64, 2, 2);
+        assert!(test_halting(&trans, 2, 500, 4).is_none());
     }
 
     #[test]
     fn test_halting_depth_1_input_count() {
-        let trans = decode_tm(64, 2, 2);
+        // TM 576 is suffix-complete at depth 1 (halts in 1 step)
+        let trans = decode_tm(576, 2, 2);
         let result = test_halting(&trans, 2, 500, 1).unwrap();
-        assert_eq!(result.len(), 4);
+        assert_eq!(result.len(), 4); // k^(2*1) = 4 inputs at depth 1
     }
 
     #[test]
-    fn test_halting_depth_2_input_count() {
-        let trans = decode_tm(64, 2, 2);
+    fn test_halting_adaptive_skip() {
+        // TM 576 at depth 2: adaptive skip triggers because worst_steps+1 <= 2*(2-1)
+        // so only depth-1 outputs are returned
+        let trans = decode_tm(576, 2, 2);
         let result = test_halting(&trans, 2, 500, 2).unwrap();
-        assert_eq!(result.len(), 20);
+        assert_eq!(result.len(), 4); // only depth-1 outputs due to adaptive skip
     }
 
     // ── Aggregate / statistical tests ───────────────────────────────────
 
     #[test]
     fn tm22_halting_count_in_expected_range() {
+        // With suffix-completeness requirement, fewer TMs pass:
+        // only TMs whose worst_steps+1 <= 2*depth are included.
         let mut count = 0u32;
         for id in 0..=4095u64 {
             let trans = decode_tm(id, 2, 2);
@@ -1423,8 +1455,8 @@ mod tests {
             }
         }
         assert!(
-            count >= 1400 && count <= 1900,
-            "TM(2,2) halting count {} outside [1400,1900]",
+            count >= 1000 && count <= 1500,
+            "TM(2,2) suffix-complete halting count {} outside [1000,1500]",
             count
         );
     }
@@ -1439,6 +1471,18 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn tm657939_excluded_by_suffix_completeness() {
+        // TM 657939 (3,2) produces Undefined in game play — it halts on
+        // small inputs but fails on larger game-history inputs. The suffix-
+        // completeness check at depth 4 should correctly exclude it.
+        let trans = decode_tm(657939, 3, 2);
+        assert!(
+            test_halting(&trans, 2, 500, 4).is_none(),
+            "TM 657939 should be excluded: not suffix-complete at depth 4"
+        );
     }
 
     // ── Cross-check with nit-games encoding ─────────────────────────────
