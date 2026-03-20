@@ -1518,7 +1518,8 @@ struct FsmGameParams {{
     uint alphabet;
     uint rounds;
     uint num_actions;
-    uint _pad[3];
+    uint _pad;
+    int payoff[8]; // interleaved [a,b] for each action pair (max 2x2=4 pairs)
 }};
 
 kernel void fsm_tournament(
@@ -1528,7 +1529,6 @@ kernel void fsm_tournament(
     device const uint2* pairs        [[buffer(3)]],
     device int2* scores              [[buffer(4)]],
     constant FsmGameParams& params   [[buffer(5)]],
-    device const int* payoff         [[buffer(6)]],
     uint gid [[thread_position_in_grid]])
 {{
     if (gid >= params.num_pairs) return;
@@ -1545,60 +1545,24 @@ kernel void fsm_tournament(
     int score_a = 0;
     int score_b = 0;
 
-    // Cycle detection: combined state = a_state * S + b_state
-    // Maximum combined states = S * S. When we see a repeated combined
-    // state, we have found a cycle and can extrapolate in O(1).
-    const uint max_combined = FSM_MAX_STATES * FSM_MAX_STATES;
-    uint cycle_round[FSM_MAX_STATES * FSM_MAX_STATES];
-    int cycle_sa[FSM_MAX_STATES * FSM_MAX_STATES];
-    int cycle_sb[FSM_MAX_STATES * FSM_MAX_STATES];
-    for (uint i = 0u; i < max_combined; i++) {{
-        cycle_round[i] = 0xFFFFFFFFu;
-    }}
+    uint prev_a_action = 0u;
+    uint prev_b_action = 0u;
 
     for (uint round = 0u; round < params.rounds; round++) {{
-        uint combined = a_state * S + b_state;
-        if (combined < max_combined) {{
-            if (cycle_round[combined] != 0xFFFFFFFFu) {{
-                uint cycle_len = round - cycle_round[combined];
-                if (cycle_len > 0u) {{
-                    int delta_a = score_a - cycle_sa[combined];
-                    int delta_b = score_b - cycle_sb[combined];
-                    uint remaining = params.rounds - round;
-                    uint full_cycles = remaining / cycle_len;
-                    score_a += int(full_cycles) * delta_a;
-                    score_b += int(full_cycles) * delta_b;
-                    uint leftover = remaining - full_cycles * cycle_len;
-                    for (uint r = 0u; r < leftover; r++) {{
-                        uint aa = outputs[a_idx * S + a_state] % na;
-                        uint ba = outputs[b_idx * S + b_state] % na;
-                        uint pidx = aa * na + ba;
-                        score_a += payoff[pidx * 2];
-                        score_b += payoff[pidx * 2 + 1];
-                        uint new_a = transitions[a_idx * S * K + a_state * K + ba];
-                        uint new_b = transitions[b_idx * S * K + b_state * K + aa];
-                        a_state = new_a;
-                        b_state = new_b;
-                    }}
-                    scores[gid] = int2(score_a, score_b);
-                    return;
-                }}
-            }}
-            cycle_round[combined] = round;
-            cycle_sa[combined] = score_a;
-            cycle_sb[combined] = score_b;
-        }}
+        // Transition first, then output (matches CPU/WL convention)
+        uint input_a = (round == 0u) ? 0u : prev_b_action;
+        uint input_b = (round == 0u) ? 0u : prev_a_action;
+        a_state = transitions[a_idx * S * K + a_state * K + input_a];
+        b_state = transitions[b_idx * S * K + b_state * K + input_b];
 
         uint a_action = outputs[a_idx * S + a_state] % na;
         uint b_action = outputs[b_idx * S + b_state] % na;
         uint pidx = a_action * na + b_action;
-        score_a += payoff[pidx * 2];
-        score_b += payoff[pidx * 2 + 1];
+        score_a += params.payoff[pidx * 2];
+        score_b += params.payoff[pidx * 2 + 1];
 
-        uint new_a = transitions[a_idx * S * K + a_state * K + b_action];
-        uint new_b = transitions[b_idx * S * K + b_state * K + a_action];
-        a_state = new_a;
-        b_state = new_b;
+        prev_a_action = a_action;
+        prev_b_action = b_action;
     }}
 
     scores[gid] = int2(score_a, score_b);
@@ -1678,12 +1642,7 @@ kernel void fsm_tournament(
                 }
             }
 
-            // Flatten payoff entries into interleaved [score_a, score_b, ...] for GPU
-            let payoff_flat: Vec<i32> = payoff_entries
-                .iter()
-                .flat_map(|&[a, b]| vec![a, b])
-                .collect();
-
+            // Embed payoff in params struct (avoids extra buffer binding)
             #[repr(C)]
             #[derive(Copy, Clone)]
             struct FsmGameParams {
@@ -1692,81 +1651,82 @@ kernel void fsm_tournament(
                 alphabet: u32,
                 rounds: u32,
                 num_actions: u32,
-                _pad: [u32; 3],
+                _pad: u32,
+                payoff: [i32; 8], // interleaved [a,b] for each action pair
             }
 
-            // Upload shared data once
+            let num_pairs = all_pairs.len();
+
+            let mut payoff_arr = [0i32; 8];
+            for (i, entry) in payoff_entries.iter().enumerate().take(4) {
+                payoff_arr[i * 2] = entry[0];
+                payoff_arr[i * 2 + 1] = entry[1];
+            }
+
+            let params = FsmGameParams {
+                num_pairs: num_pairs as u32,
+                states: states as u32,
+                alphabet: symbols as u32,
+                rounds,
+                num_actions,
+                _pad: 0,
+                payoff: payoff_arr,
+            };
+
+            // Create buffers
             let starts_buf = self.buf_from_slice(&flat_starts);
             let outputs_buf = self.buf_from_slice(&flat_outputs);
             let transitions_buf = self.buf_from_slice(&flat_transitions);
-            let payoff_buf = self.buf_from_slice(&payoff_flat);
+            let pairs_buf = self.buf_from_slice(&all_pairs);
+            let scores_buf = self.device.new_buffer(
+                (num_pairs.max(1) * size_of::<[i32; 2]>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::write_bytes(
+                    scores_buf.contents() as *mut u8,
+                    0,
+                    num_pairs * size_of::<[i32; 2]>(),
+                );
+            }
 
-            // Process pairs in batches
-            const BATCH_SIZE: usize = 5_000_000;
+            // Dispatch — 6 bindings (same count as working TM tournament)
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&starts_buf), 0);
+            encoder.set_buffer(1, Some(&outputs_buf), 0);
+            encoder.set_buffer(2, Some(&transitions_buf), 0);
+            encoder.set_buffer(3, Some(&pairs_buf), 0);
+            encoder.set_buffer(4, Some(&scores_buf), 0);
+            encoder.set_bytes(
+                5,
+                size_of::<FsmGameParams>() as u64,
+                (&params as *const FsmGameParams).cast(),
+            );
+
+            let width = self.pipeline.thread_execution_width().max(1);
+            let threads_per_group = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (num_pairs as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            encoder.dispatch_thread_groups(groups, threads_per_group);
+            encoder.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+
+            // Read results into score matrix
+            let raw_scores = unsafe {
+                let ptr = scores_buf.contents() as *const [i32; 2];
+                std::slice::from_raw_parts(ptr, num_pairs)
+            };
+
             let mut matrix = vec![vec![0i64; n]; n];
-
-            for (batch_idx, batch) in all_pairs.chunks(BATCH_SIZE).enumerate() {
-                let batch_len = batch.len();
-                let params = FsmGameParams {
-                    num_pairs: batch_len as u32,
-                    states: states as u32,
-                    alphabet: symbols as u32,
-                    rounds,
-                    num_actions,
-                    _pad: [0; 3],
-                };
-
-                let pairs_buf = self.buf_from_slice(batch);
-                let scores_buf = self.device.new_buffer(
-                    (batch_len.max(1) * size_of::<[i32; 2]>()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                );
-                unsafe {
-                    std::ptr::write_bytes(
-                        scores_buf.contents() as *mut u8,
-                        0,
-                        batch_len * size_of::<[i32; 2]>(),
-                    );
-                }
-
-                let cmd_buf = self.queue.new_command_buffer();
-                let encoder = cmd_buf.new_compute_command_encoder();
-                encoder.set_compute_pipeline_state(&self.pipeline);
-                encoder.set_buffer(0, Some(&starts_buf), 0);
-                encoder.set_buffer(1, Some(&outputs_buf), 0);
-                encoder.set_buffer(2, Some(&transitions_buf), 0);
-                encoder.set_buffer(3, Some(&pairs_buf), 0);
-                encoder.set_buffer(4, Some(&scores_buf), 0);
-                encoder.set_bytes(
-                    5,
-                    size_of::<FsmGameParams>() as u64,
-                    (&params as *const FsmGameParams).cast(),
-                );
-                encoder.set_buffer(6, Some(&payoff_buf), 0);
-
-                let width = self.pipeline.thread_execution_width().max(1);
-                let threads_per_group = MTLSize::new(width, 1, 1);
-                let groups = MTLSize::new(
-                    (batch_len as u64 + width - 1) / width,
-                    1,
-                    1,
-                );
-                encoder.dispatch_thread_groups(groups, threads_per_group);
-                encoder.end_encoding();
-                cmd_buf.commit();
-                cmd_buf.wait_until_completed();
-
-                // Read batch results into score matrix
-                let raw_scores = unsafe {
-                    let ptr = scores_buf.contents() as *const [i32; 2];
-                    std::slice::from_raw_parts(ptr, batch_len)
-                };
-
-                let batch_start = batch_idx * BATCH_SIZE;
-                for (local_idx, score) in raw_scores.iter().enumerate() {
-                    let pair = all_pairs[batch_start + local_idx];
-                    matrix[pair[0] as usize][pair[1] as usize] = score[0] as i64;
-                }
+            for (idx, score) in raw_scores.iter().enumerate() {
+                let pair = all_pairs[idx];
+                matrix[pair[0] as usize][pair[1] as usize] = score[0] as i64;
             }
 
             Ok(matrix)

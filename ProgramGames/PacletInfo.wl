@@ -47,7 +47,10 @@ PacletObject[
           "WolframInstitute`ProgramGames`ClassificationTable",
           "WolframInstitute`ProgramGames`ShortNum",
           "WolframInstitute`ProgramGames`PayoffToString",
-          "WolframInstitute`ProgramGames`StrategyToJSON"
+          "WolframInstitute`ProgramGames`StrategyToJSON",
+          "WolframInstitute`ProgramGames`EnumerateGames",
+          "WolframInstitute`ProgramGames`GameWinner",
+          "WolframInstitute`ProgramGames`GameSpaceSurvey"
         }
       },
       {

@@ -1824,6 +1824,117 @@ mod tests {
         }
     }
 
+    // ── FSM tournament GPU vs CPU ────────────────────────────────────
+
+    #[test]
+    fn fsm_tournament_gpu_matches_cpu() {
+        let fsm_ids: Vec<u64> = vec![0, 1, 18, 19, 22, 23];
+        let states = 2usize;
+        let symbols = 2usize;
+        let rounds = 50u32;
+        let dyn_payoff = tournament::parse_game_dyn("pd").unwrap();
+        let num_actions = dyn_payoff.num_actions as u8;
+
+        let cpu_scores = run_fsm_tournament_cpu(
+            &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
+        );
+
+        // Verify CPU scores are non-zero
+        let cpu_nonzero = cpu_scores.iter()
+            .flat_map(|row| row.iter())
+            .any(|&s| s != 0);
+        assert!(cpu_nonzero, "CPU FSM tournament should have non-zero scores");
+        eprintln!("  CPU scores (first row): {:?}", &cpu_scores[0]);
+
+        match gpu::run_fsm_tournament_gpu(
+            &fsm_ids, states, symbols, rounds,
+            dyn_payoff.num_actions as u32, &dyn_payoff.entries,
+        ) {
+            Ok(gpu_scores) => {
+                eprintln!("  GPU scores (first row): {:?}", &gpu_scores[0]);
+                let gpu_nonzero = gpu_scores.iter()
+                    .flat_map(|row| row.iter())
+                    .any(|&s| s != 0);
+                assert!(gpu_nonzero, "GPU FSM tournament should have non-zero scores");
+
+                assert_eq!(gpu_scores.len(), cpu_scores.len());
+                for i in 0..fsm_ids.len() {
+                    for j in 0..fsm_ids.len() {
+                        assert_eq!(
+                            gpu_scores[i][j], cpu_scores[i][j],
+                            "Score mismatch at [{},{}]: GPU={} CPU={}",
+                            i, j, gpu_scores[i][j], cpu_scores[i][j]
+                        );
+                    }
+                }
+                eprintln!("  FSM tournament GPU vs CPU: all scores match");
+            }
+            Err(e) => {
+                eprintln!("  GPU not available, skipping FSM tournament comparison: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn metal_basic_write_test() {
+        // Minimal test: compile and dispatch a trivial Metal kernel
+        // that writes int2(42, -42) to a buffer. Verifies Metal works.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            use metal::*;
+            use std::ffi::c_void;
+
+            let device = Device::system_default().expect("no metal device");
+            let source = r#"
+                #include <metal_stdlib>
+                using namespace metal;
+                kernel void test_write(
+                    device int2* out [[buffer(0)]],
+                    uint gid [[thread_position_in_grid]])
+                {
+                    out[gid] = int2(42, -42);
+                }
+            "#;
+            let options = CompileOptions::new();
+            let library = device.new_library_with_source(source, &options)
+                .expect("shader compile failed");
+            let func = library.get_function("test_write", None)
+                .expect("function not found");
+            let pipeline = device.new_compute_pipeline_state_with_function(&func)
+                .expect("pipeline failed");
+            let queue = device.new_command_queue();
+
+            let n = 10usize;
+            let buf = device.new_buffer(
+                (n * std::mem::size_of::<[i32; 2]>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, n * 8);
+            }
+
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&buf), 0);
+            let w = pipeline.thread_execution_width();
+            enc.dispatch_thread_groups(
+                MTLSize::new(((n as u64) + w - 1) / w, 1, 1),
+                MTLSize::new(w, 1, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let result = unsafe {
+                let ptr = buf.contents() as *const [i32; 2];
+                std::slice::from_raw_parts(ptr, n)
+            };
+            eprintln!("  Metal basic write: {:?}", &result[..3]);
+            assert_eq!(result[0], [42, -42], "Metal kernel didn't write expected value");
+        }
+    }
+
     // ── FSM classify reduction table ────────────────────────────────────
 
     #[test]

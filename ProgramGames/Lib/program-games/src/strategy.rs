@@ -245,12 +245,11 @@ impl StrategyRunner {
                     history.last().copied().unwrap_or(0) as usize
                 };
 
-                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
-
-                // Transition
+                // Transition first, then output (matches WL/nit-games convention)
                 let idx = (*state) * (*k) + input.min(*k - 1);
                 *state = transitions.get(idx).copied().unwrap_or(0);
 
+                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
                 Some(output)
             }
             RunnerInner::Ca {
@@ -298,11 +297,11 @@ impl StrategyRunner {
                     opponent_last as usize
                 };
 
-                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
-
+                // Transition first, then output (matches WL/nit-games convention)
                 let idx = (*state) * (*k) + input.min(*k - 1);
                 *state = transitions.get(idx).copied().unwrap_or(0);
 
+                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
                 Some(output)
             }
             _ => {
@@ -333,6 +332,11 @@ impl StrategyRunner {
     #[allow(dead_code)]
     pub fn is_tm(&self) -> bool {
         matches!(self.inner, RunnerInner::Tm { .. })
+    }
+
+    /// Returns true if this is an FSM strategy.
+    pub fn is_fsm(&self) -> bool {
+        matches!(self.inner, RunnerInner::Fsm { .. })
     }
 }
 
@@ -930,19 +934,33 @@ pub fn play_game(
     let mut history: Vec<u8> = Vec::with_capacity(2 * rounds as usize);
     let mut score_a = 0i64;
     let mut score_b = 0i64;
+    let mut prev_a: u8 = 0;
+    let mut prev_b: u8 = 0;
 
     for round in 0..rounds {
-        let move_a = match runner_a.get_move(&history, round) {
-            Some(m) => m,
-            None => return (None, 1), // player A failed to halt
+        let move_a = if runner_a.is_fsm() {
+            runner_a.get_fsm_move(prev_b, round)
+        } else {
+            runner_a.get_move(&history, round)
         };
-        let move_b = match runner_b.get_move(&history, round) {
+        let move_a = match move_a {
             Some(m) => m,
-            None => return (None, 2), // player B failed to halt
+            None => return (None, 1),
+        };
+        let move_b = if runner_b.is_fsm() {
+            runner_b.get_fsm_move(prev_a, round)
+        } else {
+            runner_b.get_move(&history, round)
+        };
+        let move_b = match move_b {
+            Some(m) => m,
+            None => return (None, 2),
         };
 
         history.push(move_a);
         history.push(move_b);
+        prev_a = move_a;
+        prev_b = move_b;
 
         let idx = (move_a as usize) * 2 + move_b as usize;
         if let Some(payoffs) = payoff.get(idx) {
@@ -969,19 +987,36 @@ pub fn play_game_dyn(
     let mut history: Vec<u8> = Vec::with_capacity(2 * rounds as usize);
     let mut score_a = 0i64;
     let mut score_b = 0i64;
+    let mut prev_a: u8 = 0;
+    let mut prev_b: u8 = 0;
 
     for round in 0..rounds {
-        let move_a = match runner_a.get_move(&history, round) {
-            Some(m) => m,
-            None => return (None, 1), // player A failed to halt
+        // For FSMs, use get_fsm_move with the correct opponent's last action.
+        // The generic get_move reads history.last() which is always B's move,
+        // giving player B its own move instead of the opponent's.
+        let move_a = if runner_a.is_fsm() {
+            runner_a.get_fsm_move(prev_b, round)
+        } else {
+            runner_a.get_move(&history, round)
         };
-        let move_b = match runner_b.get_move(&history, round) {
+        let move_a = match move_a {
             Some(m) => m,
-            None => return (None, 2), // player B failed to halt
+            None => return (None, 1),
+        };
+        let move_b = if runner_b.is_fsm() {
+            runner_b.get_fsm_move(prev_a, round)
+        } else {
+            runner_b.get_move(&history, round)
+        };
+        let move_b = match move_b {
+            Some(m) => m,
+            None => return (None, 2),
         };
 
         history.push(move_a);
         history.push(move_b);
+        prev_a = move_a;
+        prev_b = move_b;
 
         let idx = (move_a as usize) * payoff.num_actions + move_b as usize;
         if let Some(payoffs) = payoff.get(idx) {
