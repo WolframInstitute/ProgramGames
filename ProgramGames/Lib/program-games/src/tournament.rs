@@ -221,7 +221,8 @@ pub fn run_tm_on_tape(
 // ── CPU game play ───────────────────────────────────────────────────────────
 
 /// Play one iterated game between two TMs.
-/// Returns (score_a, score_b).
+/// Returns ((score_a, score_b), failed_flag).
+/// failed_flag: 0 = both halted, 1 = a failed, 2 = b failed, 3 = both failed.
 pub fn play_game_cpu(
     trans_a: &[TmTransition],
     trans_b: &[TmTransition],
@@ -229,11 +230,12 @@ pub fn play_game_cpu(
     max_steps: u32,
     rounds: u32,
     payoff: &DynPayoff,
-) -> (i64, i64) {
+) -> ((i64, i64), u8) {
     let na = payoff.num_actions;
     let mut history: Vec<u8> = Vec::with_capacity(2 * rounds as usize);
     let mut score_a = 0i64;
     let mut score_b = 0i64;
+    let mut failed: u8 = 0;
 
     for round in 0..rounds {
         let (move_a, move_b) = if round == 0 {
@@ -241,6 +243,8 @@ pub fn play_game_cpu(
         } else {
             let (ha, out_a) = run_tm_on_tape(trans_a, symbols, &history, max_steps);
             let (hb, out_b) = run_tm_on_tape(trans_b, symbols, &history, max_steps);
+            if !ha { failed |= 1; }
+            if !hb { failed |= 2; }
             let ma = if ha { out_a % na as u8 } else { 1 }; // timeout -> defect
             let mb = if hb { out_b % na as u8 } else { 1 };
             (ma, mb)
@@ -256,7 +260,7 @@ pub fn play_game_cpu(
         }
     }
 
-    (score_a, score_b)
+    ((score_a, score_b), failed)
 }
 
 // ── CPU tournament ──────────────────────────────────────────────────────────
@@ -275,7 +279,8 @@ pub fn all_pairs(n: usize) -> Vec<(usize, usize)> {
 }
 
 /// Run the full tournament on CPU using rayon.
-/// Returns score_matrix[i][j] = score of ids[i] when playing against ids[j].
+/// Returns (survivors, score_matrix) where survivors are indices of TMs that
+/// always halted, and score_matrix only includes survivors.
 pub fn run_tournament_cpu(
     ids: &[u64],
     states: u16,
@@ -283,7 +288,7 @@ pub fn run_tournament_cpu(
     max_steps: u32,
     rounds: u32,
     payoff: &DynPayoff,
-) -> Vec<Vec<i64>> {
+) -> (Vec<usize>, Vec<Vec<i64>>) {
     let n = ids.len();
     let transitions: Vec<Vec<TmTransition>> = ids
         .iter()
@@ -299,11 +304,15 @@ pub fn run_tournament_cpu(
         rounds
     );
 
-    // Parallel over pairs
+    // Parallel over pairs, tracking non-halting TMs
+    use std::sync::Mutex;
+    let failed_set: Mutex<std::collections::HashSet<usize>> =
+        Mutex::new(std::collections::HashSet::new());
+
     let results: Vec<((usize, usize), (i64, i64))> = pairs
         .par_iter()
         .map(|&(i, j)| {
-            let (sa, sb) = play_game_cpu(
+            let ((sa, sb), failed_flag) = play_game_cpu(
                 &transitions[i],
                 &transitions[j],
                 symbols,
@@ -311,16 +320,36 @@ pub fn run_tournament_cpu(
                 rounds,
                 payoff,
             );
+            if failed_flag != 0 {
+                let mut fs = failed_set.lock().unwrap();
+                if failed_flag & 1 != 0 { fs.insert(i); }
+                if failed_flag & 2 != 0 { fs.insert(j); }
+            }
             ((i, j), (sa, sb))
         })
         .collect();
 
-    // Assemble score matrix
-    let mut matrix = vec![vec![0i64; n]; n];
-    for ((i, j), (sa, _sb)) in &results {
-        matrix[*i][*j] = *sa;
+    let failed = failed_set.into_inner().unwrap();
+    if !failed.is_empty() {
+        let failed_ids: Vec<u64> = failed.iter().map(|&i| ids[i]).collect();
+        eprintln!("  Excluded {} non-halting TMs: {:?}", failed.len(), failed_ids);
     }
-    matrix
+
+    // Build list of surviving indices
+    let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
+    let m = survivors.len();
+
+    // Build compact score matrix with only survivors
+    let mut matrix = vec![vec![0i64; m]; m];
+    for ((i, j), (sa, _sb)) in &results {
+        if !failed.contains(i) && !failed.contains(j) {
+            let si = survivors.iter().position(|&x| x == *i).unwrap();
+            let sj = survivors.iter().position(|&x| x == *j).unwrap();
+            matrix[si][sj] = *sa;
+        }
+    }
+
+    (survivors, matrix)
 }
 
 // ── Output ──────────────────────────────────────────────────────────────────
@@ -797,7 +826,7 @@ mod tests {
         // Self vs self for 10 rounds → score = -10 each.
         let trans = decode_tm(64, 2, 2);
         let payoff = parse_game_dyn("pd").unwrap();
-        let (sa, sb) = play_game_cpu(&trans, &trans, 2, 500, 10, &payoff);
+        let ((sa, sb), _failed) = play_game_cpu(&trans, &trans, 2, 500, 10, &payoff);
         assert_eq!(sa, -10);
         assert_eq!(sb, -10);
     }
@@ -809,7 +838,7 @@ mod tests {
         // For now, test that round 0 both cooperate.
         let trans = decode_tm(64, 2, 2);
         let payoff = parse_game_dyn("pd").unwrap();
-        let (sa, _sb) = play_game_cpu(&trans, &trans, 2, 500, 1, &payoff);
+        let ((sa, _sb), _failed) = play_game_cpu(&trans, &trans, 2, 500, 1, &payoff);
         // Round 0: both cooperate → CC = (-1, -1)
         assert_eq!(sa, -1);
     }
@@ -819,11 +848,12 @@ mod tests {
         // Run a tiny tournament with 3 known-halting TMs
         let ids = vec![64, 65, 192];
         let payoff = parse_game_dyn("pd").unwrap();
-        let scores = run_tournament_cpu(&ids, 2, 2, 500, 10, &payoff);
-        assert_eq!(scores.len(), 3);
-        assert_eq!(scores[0].len(), 3);
+        let (survivors, scores) = run_tournament_cpu(&ids, 2, 2, 500, 10, &payoff);
+        let m = survivors.len();
+        assert_eq!(scores.len(), m);
+        assert_eq!(scores[0].len(), m);
         // Diagonal should be 0 (no self-play in pairs)
-        for i in 0..3 {
+        for i in 0..m {
             assert_eq!(scores[i][i], 0, "diagonal scores[{}][{}] should be 0", i, i);
         }
     }

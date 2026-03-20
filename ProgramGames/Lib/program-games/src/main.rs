@@ -63,9 +63,11 @@ enum Cmd {
         #[arg(long)]
         with_outputs: bool,
 
-        /// Use Metal GPU acceleration (macOS). Falls back to CPU if unavailable.
-        #[arg(long)]
-        gpu: bool,
+        /// GPU is on by default. Pass --no-gpu to disable. --gpu accepted for compatibility.
+        #[arg(long = "no-gpu")]
+        no_gpu: bool,
+        #[arg(long = "gpu", hide = true)]
+        _gpu_compat: bool,
     },
 
     /// Print the max TM index for given states/symbols.
@@ -95,8 +97,11 @@ enum Cmd {
         /// Signature depth: test inputs up to this many rounds of history.
         #[arg(short, long, default_value_t = 4)]
         depth: u32,
-        #[arg(long)]
-        gpu: bool,
+        /// GPU is on by default. Pass --no-gpu to disable. --gpu accepted for compatibility.
+        #[arg(long = "no-gpu")]
+        no_gpu: bool,
+        #[arg(long = "gpu", hide = true)]
+        _gpu_compat: bool,
         /// Only classify these TM IDs (otherwise enumerates all halting).
         #[arg(long)]
         ids: Option<String>,
@@ -131,8 +136,11 @@ enum Cmd {
         /// Inline NDJSON strategy specs (one per line).
         #[arg(long)]
         strategies: Option<String>,
-        #[arg(long)]
-        gpu: bool,
+        /// GPU is on by default. Pass --no-gpu to disable. --gpu accepted for compatibility.
+        #[arg(long = "no-gpu")]
+        no_gpu: bool,
+        #[arg(long = "gpu", hide = true)]
+        _gpu_compat: bool,
         #[arg(long, value_enum, default_value_t = Format::Json)]
         format: Format,
     },
@@ -328,15 +336,7 @@ fn test_halting(
             outputs.push((input, out_mod2));
         }
     }
-    // Only return Some if suffix-complete: the TM reads at most worst_steps+1
-    // cells from the right end, and we tested all patterns of width 2*depth.
-    // If worst_steps+1 > 2*depth, the TM may encounter untested cell patterns
-    // on longer inputs (e.g. during 100-round game play) and fail to halt.
-    if worst_steps + 1 <= (2 * depth) as u32 {
-        Some(outputs)
-    } else {
-        None
-    }
+    Some(outputs)
 }
 
 // ── Output structs ──────────────────────────────────────────────────────────
@@ -366,9 +366,9 @@ struct SearchSummary {
 
 // ── GPU-accelerated search ───────────────────────────────────────────────
 
-/// Run the halting search using Metal GPU + CPU adaptive depth.
-/// Phase 1 (CPU): depth 1-4, adaptive skip.
-/// Phase 2 (GPU): for remaining TMs, dispatch per-depth batches.
+/// Run the halting search using Metal GPU acceleration.
+/// Phase 1 (CPU): depth 1-4 with adaptive suffix-complete skip.
+/// Phase 2 (GPU): depth 5+ with per-TM step limits.
 /// Falls back to CPU-only if GPU init fails.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn search_gpu(
@@ -408,7 +408,6 @@ fn search_gpu(
             let mut alive = true;
             for r in 1..=depth.min(4) {
                 if r > 1 && worst + 1 <= (2 * (r - 1)) as u32 {
-                    // suffix-complete
                     break;
                 }
                 let max_input = k.checked_pow(2 * r).unwrap_or(u64::MAX);
@@ -426,31 +425,18 @@ fn search_gpu(
         })
         .collect();
 
-    // Remove non-halting and suffix-complete
-    let phase1_halting: Vec<u64> = tms.iter()
-        .filter(|t| t.alive && t.worst_steps + 1 <= (2 * depth.min(4)) as u32)
-        .map(|t| t.id)
-        .collect();
-
     let mut need_gpu: Vec<&mut TmState> = tms.iter_mut()
         .filter(|t| t.alive && t.worst_steps + 1 > (2 * depth.min(4)) as u32)
         .collect();
 
-    eprintln!("  GPU phase 1 done: {} halting (suffix-complete), {} need deeper testing",
-              phase1_halting.len(), need_gpu.len());
+    eprintln!("  GPU phase 1 done: {} need deeper testing", need_gpu.len());
 
     if need_gpu.is_empty() || depth <= 4 {
-        // Only include suffix-complete TMs (guaranteed to halt on all inputs)
-        return tms.iter()
-            .filter(|t| t.alive && t.worst_steps + 1 <= (2 * depth) as u32)
-            .map(|t| t.id)
-            .collect();
+        return tms.iter().filter(|t| t.alive).map(|t| t.id).collect();
     }
 
-    // Phase 2 (GPU): test remaining TMs depth-by-depth
     let batch_size = 65536usize;
     for r in (depth.min(4) + 1)..=depth {
-        // Skip TMs that are suffix-complete
         need_gpu.retain(|t| t.alive && t.worst_steps + 1 > (2 * (r - 1)) as u32);
         if need_gpu.is_empty() { break; }
 
@@ -458,7 +444,6 @@ fn search_gpu(
         let num_inputs = k.checked_pow(2 * r).unwrap_or(u64::MAX);
         if num_inputs > u32::MAX as u64 {
             eprintln!("  Depth {} has too many inputs for GPU, falling back to CPU", r);
-            // CPU fallback for this depth
             for tm in need_gpu.iter_mut() {
                 for input in 0..num_inputs {
                     let (halted, _, steps) = run_tm(&tm.transitions, symbols, input, max_steps);
@@ -471,10 +456,8 @@ fn search_gpu(
 
         let inputs: Vec<u64> = (0..num_inputs).collect();
 
-        eprintln!("  GPU depth {}: {} TMs × {} inputs = {} pairs",
-                  r, need_gpu.len(), num_inputs, need_gpu.len() as u64 * num_inputs);
+        eprintln!("  GPU depth {}: {} TMs x {} inputs", r, need_gpu.len(), num_inputs);
 
-        // Process in GPU batches
         for batch_start in (0..need_gpu.len()).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(need_gpu.len());
             let batch_trans: Vec<Vec<TmTransition>> = need_gpu[batch_start..batch_end]
@@ -482,8 +465,6 @@ fn search_gpu(
                 .map(|t| t.transitions.clone())
                 .collect();
 
-            // Per-TM step limit: worst_steps * 4 + margin, capped at gpu_max_steps.
-            // Deeper inputs may need more steps, so we add headroom.
             let batch_limits: Vec<u32> = need_gpu[batch_start..batch_end]
                 .iter()
                 .map(|t| (t.worst_steps.saturating_mul(4).saturating_add(64)).min(gpu_max_steps))
@@ -495,8 +476,6 @@ fn search_gpu(
                     for (i, &all_halted) in results.iter().enumerate() {
                         if !all_halted {
                             let tm = &mut need_gpu[batch_start + i];
-                            // If the per-TM limit was < max_steps, CPU-verify
-                            // with full limit before declaring non-halting.
                             if batch_limits[i] < max_steps {
                                 let mut still_alive = true;
                                 for input in 0..num_inputs {
@@ -522,15 +501,9 @@ fn search_gpu(
                 }
             }
         }
-
-        // CPU re-verification for low-limit failures is handled inline above.
     }
 
-    // Only include suffix-complete TMs (guaranteed to halt on all inputs)
-    tms.iter()
-        .filter(|t| t.alive && t.worst_steps + 1 <= (2 * depth) as u32)
-        .map(|t| t.id)
-        .collect()
+    tms.iter().filter(|t| t.alive).map(|t| t.id).collect()
 }
 
 /// CPU-only search (existing logic).
@@ -597,8 +570,10 @@ fn main() {
             end,
             format,
             with_outputs,
-            gpu: use_gpu,
+            no_gpu,
+            ..
         } => {
+            let use_gpu = !no_gpu;
             let max_id = match tm_max_index(states, symbols) {
                 Some(m) if m <= u64::MAX as u128 => m as u64,
                 Some(_) => {
@@ -749,10 +724,12 @@ fn main() {
             symbols,
             max_steps,
             depth,
-            gpu: use_gpu,
+            no_gpu,
             ids,
             ids_file,
+            ..
         } => {
+            let use_gpu = !no_gpu;
             // Get TM IDs: from args, or find all halting
             let tm_ids = if ids.is_some() || ids_file.is_some() {
                 tournament::parse_ids(&ids, &ids_file).unwrap_or_else(|e| {
@@ -889,9 +866,11 @@ fn main() {
             ids,
             strategies_file,
             strategies,
-            gpu: use_gpu,
+            no_gpu,
             format: _format,
+            ..
         } => {
+            let use_gpu = !no_gpu;
             // Parse game payoffs
             let dyn_payoff = match tournament::parse_game_dyn(&game) {
                 Ok(p) => p,
@@ -982,27 +961,30 @@ fn main() {
                 );
 
                 // Dispatch to GPU or CPU
+                let survivors: Vec<usize>;
                 let scores: Vec<Vec<i64>>;
 
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 {
                     if use_gpu {
-                        scores = match gpu::run_tournament_gpu(
+                        match gpu::run_tournament_gpu(
                             &tm_ids, states, symbols, max_steps, rounds,
                             dyn_payoff.num_actions as u32, &dyn_payoff.entries,
                         ) {
-                            Ok(s) => s,
+                            Ok((s, sc)) => { survivors = s; scores = sc; }
                             Err(e) => {
                                 eprintln!("  GPU tournament failed ({}), falling back to CPU", e);
-                                tournament::run_tournament_cpu(
+                                let (s, sc) = tournament::run_tournament_cpu(
                                     &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
-                                )
+                                );
+                                survivors = s; scores = sc;
                             }
                         };
                     } else {
-                        scores = tournament::run_tournament_cpu(
+                        let (s, sc) = tournament::run_tournament_cpu(
                             &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                         );
+                        survivors = s; scores = sc;
                     }
                 }
                 #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -1010,13 +992,16 @@ fn main() {
                     if use_gpu {
                         eprintln!("  Metal not compiled in, using CPU");
                     }
-                    scores = tournament::run_tournament_cpu(
+                    let (s, sc) = tournament::run_tournament_cpu(
                         &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                     );
+                    survivors = s; scores = sc;
                 }
 
+                let survivor_ids: Vec<u64> = survivors.iter().map(|&i| tm_ids[i]).collect();
+
                 let output = tournament::build_output(
-                    &tm_ids, scores, rounds, &game, states, symbols,
+                    &survivor_ids, scores, rounds, &game, states, symbols,
                 );
 
                 eprintln!(
@@ -1221,47 +1206,31 @@ mod tests {
     }
 
     #[test]
-    fn test_halting_suffix_complete_tm() {
-        // TM 576 (2,2): both state-1 transitions move right, so it halts
-        // in exactly 1 step on every input. Suffix-complete at depth 1.
-        let trans = decode_tm(576, 2, 2);
+    fn test_halting_tm64_passes() {
+        let trans = decode_tm(64, 2, 2);
         let result = test_halting(&trans, 2, 500, 4);
         assert!(result.is_some());
-        // Adaptive skip at depth 2: worst_steps=1, 1+1<=2*1 → returns depth-1 outputs only
-        assert_eq!(result.unwrap().len(), 4);
-    }
-
-    #[test]
-    fn test_halting_tm64_not_suffix_complete() {
-        // TM 64 halts on all small inputs but reads the entire tape,
-        // so worst_steps grows with input size → never suffix-complete.
-        let trans = decode_tm(64, 2, 2);
-        assert!(test_halting(&trans, 2, 500, 4).is_none());
+        assert_eq!(result.unwrap().len(), 4 + 16 + 64 + 256);
     }
 
     #[test]
     fn test_halting_depth_1_input_count() {
-        // TM 576 is suffix-complete at depth 1 (halts in 1 step)
-        let trans = decode_tm(576, 2, 2);
+        let trans = decode_tm(64, 2, 2);
         let result = test_halting(&trans, 2, 500, 1).unwrap();
-        assert_eq!(result.len(), 4); // k^(2*1) = 4 inputs at depth 1
+        assert_eq!(result.len(), 4);
     }
 
     #[test]
-    fn test_halting_adaptive_skip() {
-        // TM 576 at depth 2: adaptive skip triggers because worst_steps+1 <= 2*(2-1)
-        // so only depth-1 outputs are returned
-        let trans = decode_tm(576, 2, 2);
+    fn test_halting_depth_2_input_count() {
+        let trans = decode_tm(64, 2, 2);
         let result = test_halting(&trans, 2, 500, 2).unwrap();
-        assert_eq!(result.len(), 4); // only depth-1 outputs due to adaptive skip
+        assert_eq!(result.len(), 20);
     }
 
     // ── Aggregate / statistical tests ───────────────────────────────────
 
     #[test]
     fn tm22_halting_count_in_expected_range() {
-        // With suffix-completeness requirement, fewer TMs pass:
-        // only TMs whose worst_steps+1 <= 2*depth are included.
         let mut count = 0u32;
         for id in 0..=4095u64 {
             let trans = decode_tm(id, 2, 2);
@@ -1269,8 +1238,8 @@ mod tests {
                 count += 1;
             }
         }
-        assert!(count >= 1000 && count <= 1500,
-                "TM(2,2) suffix-complete halting count {} outside [1000,1500]", count);
+        assert!(count >= 1400 && count <= 1900,
+                "TM(2,2) halting count {} outside [1400,1900]", count);
     }
 
     #[test]

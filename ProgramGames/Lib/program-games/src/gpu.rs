@@ -180,7 +180,7 @@ struct GameParams {
 };
 
 // Run a TM on history bits as tape. Returns move (output_symbol % num_actions),
-// or 1 (defect) on timeout/non-halt.
+// or num_actions (sentinel = non-halt) on timeout.
 // Tape layout: [0 0 ... 0 | history[0] ... history[hist_len-1]]
 //               ^left_pad
 // Head starts at rightmost history bit.
@@ -193,9 +193,9 @@ uint run_tm_inline(
     uint max_steps,
     uint num_actions)
 {
+    const uint NONHALT = num_actions; // sentinel: value >= num_actions means non-halt
+
     // Allocate tape with left padding in thread-local memory
-    // Max tape size: max_steps + 1 (left pad) + hist_len
-    // We cap at a reasonable size for GPU thread stack
     const uint MAX_TM_TAPE = 4096;
     uchar tape[MAX_TM_TAPE];
 
@@ -203,7 +203,7 @@ uint run_tm_inline(
     uint tape_len = left_pad + hist_len;
 
     if (tape_len > MAX_TM_TAPE) {
-        return 1; // too large, defect
+        return NONHALT;
     }
 
     // Zero the left padding
@@ -233,18 +233,18 @@ uint run_tm_inline(
             head++;
         } else {
             if (head == 0) {
-                return 1; // ran off left edge, defect
+                return NONHALT; // ran off left edge
             }
             head--;
         }
 
         state = t.next;
         if (state == 0u) {
-            return 1; // invalid state, defect
+            return NONHALT;
         }
     }
 
-    return 1; // timeout, defect
+    return NONHALT; // timeout
 }
 
 kernel void tm_tournament(
@@ -253,6 +253,7 @@ kernel void tm_tournament(
     device int2* scores                         [[buffer(2)]],
     constant GameParams& params                 [[buffer(3)]],
     device const int* payoff                    [[buffer(4)]],
+    device atomic_uint* failed_flags            [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= params.num_pairs) return;
@@ -283,6 +284,16 @@ kernel void tm_tournament(
         } else {
             move_a = run_tm_inline(trans_a, k, history, hist_len, params.max_steps, na);
             move_b = run_tm_inline(trans_b, k, history, hist_len, params.max_steps, na);
+
+            // Detect non-halting (sentinel = na means non-halt)
+            if (move_a >= na) {
+                atomic_fetch_or_explicit(&failed_flags[a_idx], 1u, memory_order_relaxed);
+                move_a = 1; // default to defect for scoring
+            }
+            if (move_b >= na) {
+                atomic_fetch_or_explicit(&failed_flags[b_idx], 1u, memory_order_relaxed);
+                move_b = 1;
+            }
         }
 
         // Append moves to history
@@ -473,7 +484,9 @@ kernel void tm_tournament(
             })
         }
 
-        /// Run a tournament on GPU. Returns score_matrix[i][j].
+        /// Run a tournament on GPU. Returns (survivors, score_matrix) where
+        /// survivors are indices of TMs that always halted, and score_matrix
+        /// only includes survivors.
         pub fn run_tournament(
             &self,
             ids: &[u64],
@@ -483,10 +496,10 @@ kernel void tm_tournament(
             rounds: u32,
             num_actions: u32,
             payoff_entries: &[[i32; 2]],
-        ) -> Result<Vec<Vec<i64>>, String> {
+        ) -> Result<(Vec<usize>, Vec<Vec<i64>>), String> {
             let n = ids.len();
             if n == 0 {
-                return Ok(vec![]);
+                return Ok((vec![], vec![]));
             }
 
             // Decode all TMs
@@ -539,18 +552,20 @@ kernel void tm_tournament(
             let trans_buf = self.buf_from_slice(&gpu_trans);
             let pairs_buf = self.buf_from_slice(&pairs);
             let payoff_buf = self.buf_from_slice(&payoff_flat);
-            // scores: one int2 per pair
             let scores_buf = self.device.new_buffer(
                 (num_pairs.max(1) * size_of::<[i32; 2]>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
-            // Zero scores
+            // Per-TM failed flags (atomic uint, zeroed)
+            let failed_buf = self.device.new_buffer(
+                (n.max(1) * size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             unsafe {
-                std::ptr::write_bytes(
-                    scores_buf.contents() as *mut u8,
-                    0,
-                    num_pairs * size_of::<[i32; 2]>(),
-                );
+                std::ptr::write_bytes(scores_buf.contents() as *mut u8, 0,
+                    num_pairs * size_of::<[i32; 2]>());
+                std::ptr::write_bytes(failed_buf.contents() as *mut u8, 0,
+                    n * size_of::<u32>());
             }
 
             // Dispatch
@@ -566,6 +581,7 @@ kernel void tm_tournament(
                 (&params as *const GameParams).cast(),
             );
             encoder.set_buffer(4, Some(&payoff_buf), 0);
+            encoder.set_buffer(5, Some(&failed_buf), 0);
 
             let width = self.pipeline.thread_execution_width().max(1);
             let threads_per_group = MTLSize::new(width, 1, 1);
@@ -579,25 +595,48 @@ kernel void tm_tournament(
             cmd_buf.commit();
             cmd_buf.wait_until_completed();
 
-            // Read results and assemble score matrix
+            // Read results
             let raw_scores = unsafe {
                 let ptr = scores_buf.contents() as *const [i32; 2];
                 std::slice::from_raw_parts(ptr, num_pairs)
             };
+            let raw_failed = unsafe {
+                let ptr = failed_buf.contents() as *const u32;
+                std::slice::from_raw_parts(ptr, n)
+            };
 
-            let mut matrix = vec![vec![0i64; n]; n];
+            // Determine survivors (TMs that never failed to halt)
+            let failed: std::collections::HashSet<usize> = raw_failed.iter()
+                .enumerate()
+                .filter(|(_, &f)| f != 0)
+                .map(|(i, _)| i)
+                .collect();
+
+            if !failed.is_empty() {
+                let failed_ids: Vec<u64> = failed.iter().map(|&i| ids[i]).collect();
+                eprintln!("  GPU excluded {} non-halting TMs: {:?}", failed.len(), failed_ids);
+            }
+
+            let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
+            let m = survivors.len();
+
+            // Build compact score matrix with only survivors
+            let mut matrix = vec![vec![0i64; m]; m];
             let mut pair_idx = 0;
             for i in 0..n {
                 for j in 0..n {
                     if i != j {
-                        matrix[i][j] = raw_scores[pair_idx][0] as i64;
-                        // raw_scores[pair_idx][1] is j's score against i
+                        if !failed.contains(&i) && !failed.contains(&j) {
+                            let si = survivors.iter().position(|&x| x == i).unwrap();
+                            let sj = survivors.iter().position(|&x| x == j).unwrap();
+                            matrix[si][sj] = raw_scores[pair_idx][0] as i64;
+                        }
                         pair_idx += 1;
                     }
                 }
             }
 
-            Ok(matrix)
+            Ok((survivors, matrix))
         }
 
         fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
@@ -1396,6 +1435,7 @@ kernel void fsm_tournament(
 pub use metal_impl::MetalSearcher;
 
 /// Run a tournament on GPU. Public wrapper that handles Metal init.
+/// Returns (survivors, score_matrix) — same as CPU tournament.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub fn run_tournament_gpu(
     ids: &[u64],
@@ -1405,7 +1445,7 @@ pub fn run_tournament_gpu(
     rounds: u32,
     num_actions: u32,
     payoff_entries: &[[i32; 2]],
-) -> Result<Vec<Vec<i64>>, String> {
+) -> Result<(Vec<usize>, Vec<Vec<i64>>), String> {
     let gpu = metal_impl::MetalTournament::new()?;
     gpu.run_tournament(ids, states, symbols, max_steps, rounds, num_actions, payoff_entries)
 }
@@ -1419,7 +1459,7 @@ pub fn run_tournament_gpu(
     _rounds: u32,
     _num_actions: u32,
     _payoff_entries: &[[i32; 2]],
-) -> Result<Vec<Vec<i64>>, String> {
+) -> Result<(Vec<usize>, Vec<Vec<i64>>), String> {
     Err("Metal not available".to_string())
 }
 
