@@ -1549,14 +1549,19 @@ kernel void fsm_tournament(
     uint prev_b_action = 0u;
 
     for (uint round = 0u; round < params.rounds; round++) {{
-        // Transition first, then output (matches CPU/WL convention)
-        uint input_a = (round == 0u) ? 0u : prev_b_action;
-        uint input_b = (round == 0u) ? 0u : prev_a_action;
-        a_state = transitions[a_idx * S * K + a_state * K + input_a];
-        b_state = transitions[b_idx * S * K + b_state * K + input_b];
+        uint a_action, b_action;
+        if (round == 0u) {{
+            // Round 0: output from initial state, no transition (matches WL)
+            a_action = outputs[a_idx * S + a_state] % na;
+            b_action = outputs[b_idx * S + b_state] % na;
+        }} else {{
+            // Round 1+: transition first using opponent's last action, then output
+            a_state = transitions[a_idx * S * K + a_state * K + prev_b_action];
+            b_state = transitions[b_idx * S * K + b_state * K + prev_a_action];
+            a_action = outputs[a_idx * S + a_state] % na;
+            b_action = outputs[b_idx * S + b_state] % na;
+        }}
 
-        uint a_action = outputs[a_idx * S + a_state] % na;
-        uint b_action = outputs[b_idx * S + b_state] % na;
         uint pidx = a_action * na + b_action;
         score_a += params.payoff[pidx * 2];
         score_b += params.payoff[pidx * 2 + 1];
@@ -1632,13 +1637,11 @@ kernel void fsm_tournament(
                 }
             }
 
-            // Build all ordered pairs (i, j) where i != j
-            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * (n - 1));
+            // Build all ordered pairs (i, j) including self-play (matches WL Tuples[list, 2])
+            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * n);
             for i in 0..n {
                 for j in 0..n {
-                    if i != j {
-                        all_pairs.push([i as u32, j as u32]);
-                    }
+                    all_pairs.push([i as u32, j as u32]);
                 }
             }
 

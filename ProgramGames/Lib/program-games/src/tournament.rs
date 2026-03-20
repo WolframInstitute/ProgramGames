@@ -663,26 +663,66 @@ pub fn build_mixed_output(
         }
     }
 
+    // Ranking: match WL Code-02.nb TournamentScoreboard convention.
+    // Each ordered pair (i, j) from Tuples contributes one game to BOTH players.
+    // Player i (as A) gets payoff scores[i][j]. Player j (as B) gets payoff scores[j][i]
+    // (by symmetry of the Rust game engine). The payoff is Mean-aggregated over rounds.
+    // Win/loss is determined by Sign(payoff_A - payoff_B) per pair.
+    // Each FSM has 2*n games (n as player A, n as player B including self-play).
+    let r = rounds as f64;
     let mut ranking: Vec<MixedRankEntry> = labels
         .iter()
         .enumerate()
         .map(|(i, label)| {
-            let opponents: Vec<i64> = (0..n).filter(|&j| j != i).map(|j| scores[i][j]).collect();
-            let total: i64 = opponents.iter().sum();
-            let mean = if opponents.is_empty() { 0.0 } else { total as f64 / opponents.len() as f64 };
-            let median = compute_median(&opponents);
             let mut wins = 0usize;
             let mut losses = 0usize;
             let mut draws = 0usize;
+            let mut total_payoff = 0.0f64;
+
             for j in 0..n {
-                if j == i { continue; }
-                if scores[i][j] > scores[j][i] { wins += 1; }
-                else if scores[i][j] < scores[j][i] { losses += 1; }
+                // Pair (i, j): i is player A, j is player B
+                let pay_a = scores[i][j] as f64 / r; // Mean payoff for player A (i)
+                let pay_b = scores[j][i] as f64 / r; // Mean payoff for player B (j), by symmetry
+                let margin = pay_a - pay_b;
+                total_payoff += pay_a;
+                if margin > 0.0 { wins += 1; }
+                else if margin < 0.0 { losses += 1; }
+                else { draws += 1; }
+
+                // Pair (j, i): i is player B, j is player A
+                // By symmetry, i's payoff as B = scores[i][j] / r (same as when A)
+                // j's payoff as A = scores[j][i] / r
+                let pay_i_as_b = scores[i][j] as f64 / r;
+                let pay_j_as_a = scores[j][i] as f64 / r;
+                let margin_b = pay_i_as_b - pay_j_as_a;
+                total_payoff += pay_i_as_b;
+                if margin_b > 0.0 { wins += 1; }
+                else if margin_b < 0.0 { losses += 1; }
                 else { draws += 1; }
             }
+
+            let games = 2 * n;
+            let mean = total_payoff / games as f64;
+            // For median, use per-game Mean-aggregated payoffs from all games
+            let mut per_game: Vec<f64> = Vec::with_capacity(games);
+            for j in 0..n {
+                per_game.push(scores[i][j] as f64 / r); // as player A
+                per_game.push(scores[i][j] as f64 / r); // as player B (symmetric)
+            }
+            per_game.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = if per_game.is_empty() {
+                0.0
+            } else if per_game.len() % 2 == 0 {
+                (per_game[per_game.len() / 2 - 1] + per_game[per_game.len() / 2]) / 2.0
+            } else {
+                per_game[per_game.len() / 2]
+            };
+
+            // total in the JSON is the raw sum (not Mean-aggregated) for backward compat
+            let raw_total: i64 = (0..n).map(|j| scores[i][j]).sum();
             MixedRankEntry {
                 label: label.clone(),
-                total,
+                total: raw_total,
                 mean,
                 median,
                 wins,
@@ -691,7 +731,7 @@ pub fn build_mixed_output(
             }
         })
         .collect();
-    ranking.sort_by(|a, b| b.total.cmp(&a.total));
+    ranking.sort_by(|a, b| b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal));
 
     MixedTournamentOutput {
         strategies: labels,

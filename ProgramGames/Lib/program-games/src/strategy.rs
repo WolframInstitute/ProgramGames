@@ -216,41 +216,18 @@ impl StrategyRunner {
                 k,
                 num_actions,
             } => {
-                // On round 0: output based on initial state, input defaults to 0
-                let input = if round == 0 {
-                    0usize
+                if round == 0 {
+                    // Round 0: output from initial state, no transition (matches WL)
+                    let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
+                    Some(output)
                 } else {
-                    // Opponent's last move: history[history.len() - 1] for player B's last move
-                    // when we are player A, or history[history.len() - 2] for player A's move
-                    // when we are player B. But in this engine, the FSM input is always the
-                    // opponent's last move. Since we don't know which player we are here,
-                    // we pass the opponent's move via the history layout.
-                    //
-                    // Convention: FSM always reads the opponent's last move.
-                    // For player A: opponent = last element (index len-1)
-                    // For player B: opponent = second-to-last element (index len-2)
-                    // However, in this simplified engine both players see the same history
-                    // and the FSM just uses the "other's" move. Since the caller doesn't
-                    // distinguish, we use the last round's opponent move = history[-1].
-                    //
-                    // Actually: The history is [a1,b1,a2,b2,...]. For FSMs, the input
-                    // is the opponent's last move. But since we don't track which player
-                    // this runner is, we can't determine opponent vs self. The simplest
-                    // correct approach: FSM input = opponent's last move, which the
-                    // caller must arrange. In the tournament, we handle this by passing
-                    // the correct opponent_last_move to get_fsm_move() instead.
-                    //
-                    // For now, default to reading the last history entry as the input.
-                    // The tournament code will use the dedicated fsm path.
-                    history.last().copied().unwrap_or(0) as usize
-                };
-
-                // Transition first, then output (matches WL/nit-games convention)
-                let idx = (*state) * (*k) + input.min(*k - 1);
-                *state = transitions.get(idx).copied().unwrap_or(0);
-
-                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
-                Some(output)
+                    // Round 1+: transition first, then output
+                    let input = history.last().copied().unwrap_or(0) as usize;
+                    let idx = (*state) * (*k) + input.min(*k - 1);
+                    *state = transitions.get(idx).copied().unwrap_or(0);
+                    let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
+                    Some(output)
+                }
             }
             RunnerInner::Ca {
                 rule_table,
@@ -291,18 +268,18 @@ impl StrategyRunner {
                 k,
                 num_actions,
             } => {
-                let input = if round == 0 {
-                    0usize
+                if round == 0 {
+                    // Round 0: output from initial state, no transition (matches WL)
+                    let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
+                    Some(output)
                 } else {
-                    opponent_last as usize
-                };
-
-                // Transition first, then output (matches WL/nit-games convention)
-                let idx = (*state) * (*k) + input.min(*k - 1);
-                *state = transitions.get(idx).copied().unwrap_or(0);
-
-                let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
-                Some(output)
+                    // Round 1+: transition first using opponent's last action, then output
+                    let input = opponent_last as usize;
+                    let idx = (*state) * (*k) + input.min(*k - 1);
+                    *state = transitions.get(idx).copied().unwrap_or(0);
+                    let output = outputs.get(*state).copied().unwrap_or(0) % *num_actions;
+                    Some(output)
+                }
             }
             _ => {
                 self.get_move(&[], round)

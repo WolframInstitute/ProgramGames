@@ -1312,9 +1312,9 @@ fn run_fsm_tournament_cpu(
         })
         .collect();
 
-    // Play all ordered pairs in parallel
+    // Play all ordered pairs including self-play (matches WL Tuples[list, 2])
     let pairs: Vec<(usize, usize)> = (0..n)
-        .flat_map(|i| (0..n).filter(move |&j| i != j).map(move |j| (i, j)))
+        .flat_map(|i| (0..n).map(move |j| (i, j)))
         .collect();
 
     let pair_scores: Vec<(usize, usize, i64)> = pairs
