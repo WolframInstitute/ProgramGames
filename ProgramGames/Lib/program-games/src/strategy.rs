@@ -420,18 +420,22 @@ pub fn fsm_count(states: usize, actions: usize) -> Option<u128> {
 // ── CA decode and execution ──────────────────────────────────────────────────
 
 /// Decode a CA rule number into its lookup table.
-/// Matches WL's `CellularAutomatonToRule[{n, k, r}]`.
+/// Matches WL's `CellularAutomaton[{rule, {k, r}}]` encoding.
 ///
 /// The table maps each (2r+1)-neighborhood to an output symbol.
-/// Index: for neighborhood (d0, d1, ..., d_{2r}), index = sum(d_i * k^(2r-i)).
+/// WL convention: table[i] = Floor[rule / k^i] mod k (LSD indexing).
+/// Index: for neighborhood (d0, d1, ..., d_{2r}), index = d0 + d1*k + ... + d_{2r}*k^{2r}.
 pub fn decode_ca_rule_table(rule_code: u64, k: u8, two_r: u32) -> Vec<u8> {
     let neighborhood = two_r as usize + 1;
     let k_usize = k.max(2) as usize;
     let table_len = checked_pow_usize(k_usize, neighborhood).unwrap_or(0);
-    integer_digits_unsigned(rule_code as u128, k_usize, table_len)
+    let mut table: Vec<u8> = integer_digits_unsigned(rule_code as u128, k_usize, table_len)
         .into_iter()
         .map(|d| d as u8)
-        .collect()
+        .collect();
+    // IntegerDigits gives MSD-first; reverse to get LSD-first (matching WL convention)
+    table.reverse();
+    table
 }
 
 /// Run a shrinking CA for `steps` steps on the given input row.
@@ -464,6 +468,9 @@ pub fn run_shrinking_ca(
         let next: Vec<u8> = (0..next_len)
             .map(|start| {
                 let window = &row[start..start + neighborhood];
+                // MSD Horner: w0*k^(n-1) + ... + w_{n-1}
+                // Combined with LSD-ordered table, matches WL's
+                // CellularAutomatonToRule: Reverse[Tuples] -> IntegerDigits
                 let mut idx = 0usize;
                 for &d in window {
                     idx = idx * k_usize + d as usize;
@@ -526,8 +533,9 @@ pub fn rule_array_move(
             let center = row[j];
             let right = row[(j + 1) % width];
 
+            // MSD Horner indexing with LSD table (matches WL CellularAutomatonToRule)
             let input = if two_r == 1 {
-                // r=1/2: alternating neighborhood
+                // r=1/2: alternating 2-cell neighborhood
                 if (step + 1) % 2 == 1 {
                     // odd step (1-indexed): (center, right)
                     (center as usize) * k_usize + right as usize
@@ -1157,24 +1165,21 @@ mod tests {
 
     #[test]
     fn ca_rule_table_elementary_rule_30() {
-        // Elementary CA: k=2, r=0.5 -> two_r=1, neighborhood=2
-        // Wait, for elementary CAs: k=2, r=1 -> two_r=2, neighborhood=3
-        // Rule 30 = 00011110 in binary -> table[0..8]
+        // Elementary CA: k=2, r=1 -> two_r=2, neighborhood=3
+        // WL convention: table[i] = Floor[30/2^i] mod 2 (LSD indexing)
+        // table = [0, 1, 1, 1, 1, 0, 0, 0]
         let table = decode_ca_rule_table(30, 2, 2);
         assert_eq!(table.len(), 8); // 2^3 = 8
-        // Rule 30 in IntegerDigits[30, 2, 8]:
-        // 30 = 0*128 + 0*64 + 0*32 + 1*16 + 1*8 + 1*4 + 1*2 + 0*1
-        // digits: [0, 0, 0, 1, 1, 1, 1, 0]
-        assert_eq!(table, vec![0, 0, 0, 1, 1, 1, 1, 0]);
+        assert_eq!(table, vec![0, 1, 1, 1, 1, 0, 0, 0]);
     }
 
     #[test]
     fn ca_rule_table_elementary_rule_110() {
-        // Rule 110 = 01101110 in binary
-        // IntegerDigits[110, 2, 8] = [0, 1, 1, 0, 1, 1, 1, 0]
+        // WL convention: table[i] = Floor[110/2^i] mod 2 (LSD indexing)
+        // table = [0, 1, 1, 1, 0, 1, 1, 0]
         let table = decode_ca_rule_table(110, 2, 2);
         assert_eq!(table.len(), 8);
-        assert_eq!(table, vec![0, 1, 1, 0, 1, 1, 1, 0]);
+        assert_eq!(table, vec![0, 1, 1, 1, 0, 1, 1, 0]);
     }
 
     #[test]
@@ -1254,6 +1259,84 @@ mod tests {
         assert!(m1 < 2);
         let m2 = runner.get_move(&[0, 1, m1, 0], 2).unwrap();
         assert!(m2 < 2);
+    }
+
+    // ── CA WL-compatibility tests ──────────────────────────────────────
+
+    /// Verify decode_ca_rule_table + MSD lookup matches WL CellularAutomatonToRule.
+    /// WL: Thread[Reverse[Tuples[Range[0,k-1], 2r+1]] -> IntegerDigits[n, k, k^(2r+1)]]
+    /// For k=2, r=1/2: neighborhood {w0,w1}, output = Floor[rule / 2^(w0*2+w1)] mod 2.
+    #[test]
+    fn ca_rule_table_matches_wl_k2_r_half() {
+        // k=2, r=1/2, table_len=4
+        for rule in 0u64..16 {
+            let table = decode_ca_rule_table(rule, 2, 1);
+            for w0 in 0u8..2 {
+                for w1 in 0u8..2 {
+                    let msd_idx = (w0 as usize) * 2 + w1 as usize;
+                    let rust_out = table[msd_idx];
+                    // WL: output = Floor[rule / 2^(w0*2+w1)] mod 2
+                    let wl_out = ((rule >> msd_idx) & 1) as u8;
+                    assert_eq!(
+                        rust_out, wl_out,
+                        "rule {}, neighborhood ({},{}): Rust {} != WL {}",
+                        rule, w0, w1, rust_out, wl_out
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ca_rule_table_matches_wl_k2_r1() {
+        // k=2, r=1, table_len=8
+        for rule in 0u64..256 {
+            let table = decode_ca_rule_table(rule, 2, 2);
+            for w0 in 0u8..2 {
+                for w1 in 0u8..2 {
+                    for w2 in 0u8..2 {
+                        let msd_idx = (w0 as usize) * 4 + (w1 as usize) * 2 + w2 as usize;
+                        let rust_out = table[msd_idx];
+                        let wl_out = ((rule >> msd_idx) & 1) as u8;
+                        assert_eq!(
+                            rust_out, wl_out,
+                            "rule {}, neighborhood ({},{},{}): Rust {} != WL {}",
+                            rule, w0, w1, w2, rust_out, wl_out
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verify ShrinkingCA single step matches WL for specific cases.
+    /// WL: ShrinkingCA[{rule, 2, 1/2}][{0,0,1,1}] should give specific output.
+    #[test]
+    fn shrinking_ca_step_matches_wl_rule1() {
+        // Rule 1, k=2, r=1/2: table[msd_idx] = Floor[1/2^msd_idx] mod 2
+        // table = [1, 0, 0, 0] (only {0,0}->1)
+        let table = decode_ca_rule_table(1, 2, 1);
+        assert_eq!(table, vec![1, 0, 0, 0]);
+
+        // Apply to row [0, 0, 1, 1]:
+        // Windows: {0,0}->1, {0,1}->0, {1,1}->0
+        // Next row: [1, 0, 0]
+        let rows = run_shrinking_ca(&table, 2, 1, 1, &[0, 0, 1, 1]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1], vec![1, 0, 0]);
+    }
+
+    #[test]
+    fn shrinking_ca_step_matches_wl_rule11() {
+        // Rule 11 = 1011 binary
+        // table[0]={0,0}->1, table[1]={0,1}->1, table[2]={1,0}->0, table[3]={1,1}->1
+        let table = decode_ca_rule_table(11, 2, 1);
+        assert_eq!(table, vec![1, 1, 0, 1]);
+
+        // Apply to [0, 1, 0, 1]:
+        // Windows: {0,1}->1, {1,0}->0, {0,1}->1
+        let rows = run_shrinking_ca(&table, 2, 1, 1, &[0, 1, 0, 1]);
+        assert_eq!(rows[1], vec![1, 0, 1]);
     }
 
     // ── TM runner tests ──────────────────────────────────────────────────

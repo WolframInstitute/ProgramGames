@@ -25,7 +25,3 @@ clap = { version = "4.4", features = ["derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }
-
-[profile.release]
-lto = "thin"
-opt-level = 3

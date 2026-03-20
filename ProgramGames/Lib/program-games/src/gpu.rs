@@ -836,6 +836,7 @@ uint run_ca_inline(
 
         uchar next_row[MAX_ROW];
         for (uint pos = 0; pos < next_len; pos++) {
+            // MSD Horner with LSD table (matches WL CellularAutomatonToRule)
             uint idx = 0;
             for (uint n = 0; n < neighborhood; n++) {
                 idx = idx * k + row[pos + n];
@@ -1103,11 +1104,12 @@ kernel void ca_classify(
     uint neighborhood = two_r + 1;
     uint table_len = params.table_len;
 
-    // Decode rule table: IntegerDigits[rule_code, k, table_len]
+    // Decode rule table: LSD ordering to match WL convention
+    // table[i] = Floor[rule/k^i] mod k
     uchar rule_table[CA_MAX_TABLE];
     {
         uint tmp = rule_code;
-        for (int i = (int)table_len - 1; i >= 0; i--) {
+        for (uint i = 0; i < table_len; i++) {
             rule_table[i] = tmp % k;
             tmp /= k;
         }
@@ -1149,6 +1151,7 @@ kernel void ca_classify(
 
                 uchar next_row[CA_MAX_ROW];
                 for (uint pos = 0; pos < next_len; pos++) {
+                    // MSD Horner with LSD table (matches WL CellularAutomatonToRule)
                     uint idx = 0;
                     for (uint n = 0; n < neighborhood; n++) {
                         idx = idx * k + row[pos + n];

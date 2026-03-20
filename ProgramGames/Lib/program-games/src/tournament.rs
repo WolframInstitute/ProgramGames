@@ -549,17 +549,7 @@ pub fn build_output(
     }
 }
 
-fn compute_median(vals: &[i64]) -> f64 {
-    if vals.is_empty() { return 0.0; }
-    let mut sorted = vals.to_vec();
-    sorted.sort();
-    let n = sorted.len();
-    if n % 2 == 1 {
-        sorted[n / 2] as f64
-    } else {
-        (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
-    }
-}
+
 
 pub fn write_output(output: &TournamentOutput) {
     let stdout = io::stdout();
