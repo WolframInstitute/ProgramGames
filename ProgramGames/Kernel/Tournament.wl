@@ -62,6 +62,8 @@ StrategyToJSON[{"TM", id_Integer, s_Integer, k_Integer, ms_Integer}] :=
 StrategyToJSON[{"FSM", id_Integer, s_Integer, k_Integer}] :=
 	ExportString[<|"type" -> "fsm", "id" -> id, "s" -> s, "k" -> k|>,
 		"RawJSON", "Compact" -> True]
+StrategyToJSON[{"CA", rule_Integer, k_Integer, r_}] :=
+	StrategyToJSON[{"CA", rule, k, r, 10}]
 StrategyToJSON[{"CA", rule_Integer, k_Integer, r_, t_Integer}] :=
 	ExportString[<|"type" -> "ca", "rule" -> rule, "k" -> k,
 		"r" -> N[r], "t" -> t|>, "RawJSON", "Compact" -> True]
