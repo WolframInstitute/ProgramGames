@@ -14,6 +14,60 @@ use std::path::PathBuf;
 use crate::strategy::{play_game_dyn, StrategyRunner, StrategySpec};
 use crate::TmTransition;
 
+// ── History-to-integer conversion (matches WL HistoryToInput/FromDigits) ────
+
+/// Run a TM with history as input, matching WL HistoryToInput + OneSidedTuringMachineFunction.
+///
+/// WL does: FromDigits[Flatten[history], base] → integer → IntegerDigits → tape.
+/// The FromDigits→IntegerDigits roundtrip is equivalent to stripping leading zeros.
+/// This avoids integer overflow for long histories (200+ binary digits > u64 range).
+fn run_tm_from_history(
+    transitions: &[TmTransition],
+    symbols: u8,
+    history: &[u8],
+    max_steps: u32,
+) -> (bool, u8) {
+    // Strip leading zeros (equivalent to FromDigits → IntegerDigits roundtrip)
+    let start = history.iter().position(|&d| d != 0).unwrap_or(history.len());
+    let digits = if start >= history.len() {
+        // All zeros or empty → input is 0 → tape is [0]
+        vec![0u8]
+    } else {
+        history[start..].to_vec()
+    };
+
+    // Run TM with digits as tape (same as run_tm but from digits directly)
+    let k = symbols.max(2);
+    let mut tape = digits;
+    let mut head: usize = tape.len().saturating_sub(1);
+    let mut state: u16 = 1;
+
+    for _step in 0..max_steps {
+        let read = tape.get(head).copied().unwrap_or(0);
+        let idx = (state.saturating_sub(1) as usize) * (k as usize) + (read as usize);
+        let Some(&trans) = transitions.get(idx) else {
+            return (false, 0);
+        };
+        if let Some(cell) = tape.get_mut(head) {
+            *cell = trans.write;
+        }
+        if trans.move_right && head + 1 == tape.len() {
+            let out = tape.last().copied().unwrap_or(0);
+            return (true, out % 2);
+        }
+        if trans.move_right {
+            if head + 1 < tape.len() { head += 1; }
+        } else if head == 0 {
+            tape.insert(0, 0);
+        } else {
+            head -= 1;
+        }
+        state = trans.next;
+        if state == 0 { return (false, 0); }
+    }
+    (false, 0)
+}
+
 // ── Payoff parsing ──────────────────────────────────────────────────────────
 
 /// Payoff matrix: payoff[move_a * 2 + move_b] = [score_a, score_b]
@@ -241,8 +295,9 @@ pub fn play_game_cpu(
         let (move_a, move_b) = if round == 0 {
             (0u8, 0u8) // cooperate on empty history
         } else {
-            let (ha, out_a) = run_tm_on_tape(trans_a, symbols, &history, max_steps);
-            let (hb, out_b) = run_tm_on_tape(trans_b, symbols, &history, max_steps);
+            // Run TMs with history as input (strips leading zeros to match WL FromDigits)
+            let (ha, out_a) = run_tm_from_history(trans_a, symbols, &history, max_steps);
+            let (hb, out_b) = run_tm_from_history(trans_b, symbols, &history, max_steps);
             if !ha { failed |= 1; }
             if !hb { failed |= 2; }
             let ma = if ha { out_a % na as u8 } else { 1 }; // timeout -> defect
@@ -265,22 +320,23 @@ pub fn play_game_cpu(
 
 // ── CPU tournament ──────────────────────────────────────────────────────────
 
-/// Build all ordered pairs (i, j) where i != j (Tuples[ids, 2] in WL).
+/// Build all ordered pairs (i, j) including self-play (Tuples[ids, 2] in WL).
 pub fn all_pairs(n: usize) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::with_capacity(n * (n - 1));
+    // Include self-play to match WL Tuples[list, 2] convention
+    let mut pairs = Vec::with_capacity(n * n);
     for i in 0..n {
         for j in 0..n {
-            if i != j {
-                pairs.push((i, j));
-            }
+            pairs.push((i, j));
         }
     }
     pairs
 }
 
 /// Run the full tournament on CPU using rayon.
-/// Returns (survivors, score_matrix) where survivors are indices of TMs that
-/// always halted, and score_matrix only includes survivors.
+/// Returns (survivors, a_scores, b_scores) where survivors are indices of TMs that
+/// always halted, and score matrices only include survivors.
+/// a_scores[i][j] = player i's payoff as A when i plays A against j as B.
+/// b_scores[i][j] = player j's payoff as B when i plays A against j as B.
 pub fn run_tournament_cpu(
     ids: &[u64],
     states: u16,
@@ -288,7 +344,7 @@ pub fn run_tournament_cpu(
     max_steps: u32,
     rounds: u32,
     payoff: &DynPayoff,
-) -> (Vec<usize>, Vec<Vec<i64>>) {
+) -> (Vec<usize>, Vec<Vec<i64>>, Vec<Vec<i64>>) {
     let n = ids.len();
     let transitions: Vec<Vec<TmTransition>> = ids
         .iter()
@@ -339,17 +395,19 @@ pub fn run_tournament_cpu(
     let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
     let m = survivors.len();
 
-    // Build compact score matrix with only survivors
-    let mut matrix = vec![vec![0i64; m]; m];
-    for ((i, j), (sa, _sb)) in &results {
+    // Build compact score matrices with only survivors
+    let mut a_matrix = vec![vec![0i64; m]; m];
+    let mut b_matrix = vec![vec![0i64; m]; m];
+    for ((i, j), (sa, sb)) in &results {
         if !failed.contains(i) && !failed.contains(j) {
             let si = survivors.iter().position(|&x| x == *i).unwrap();
             let sj = survivors.iter().position(|&x| x == *j).unwrap();
-            matrix[si][sj] = *sa;
+            a_matrix[si][sj] = *sa;
+            b_matrix[si][sj] = *sb;
         }
     }
 
-    (survivors, matrix)
+    (survivors, a_matrix, b_matrix)
 }
 
 // ── Output ──────────────────────────────────────────────────────────────────
@@ -364,6 +422,7 @@ pub struct TournamentOutput {
     pub num_machines: usize,
     pub num_pairs: usize,
     pub scores: Vec<Vec<i64>>,
+    pub b_scores: Vec<Vec<i64>>,
     pub pairwise: Vec<PairResult>,
     pub ranking: Vec<RankEntry>,
 }
@@ -391,7 +450,8 @@ pub struct RankEntry {
 
 pub fn build_output(
     ids: &[u64],
-    scores: Vec<Vec<i64>>,
+    a_scores: Vec<Vec<i64>>,
+    b_scores: Vec<Vec<i64>>,
     rounds: u32,
     game: &str,
     states: u16,
@@ -399,45 +459,80 @@ pub fn build_output(
 ) -> TournamentOutput {
     let n = ids.len();
 
-    // Pairwise results
-    let mut pairwise = Vec::with_capacity(n * (n - 1));
+    // Pairwise results (all ordered pairs including self-play)
+    let mut pairwise = Vec::with_capacity(n * n);
     for i in 0..n {
         for j in 0..n {
-            if i != j {
-                pairwise.push(PairResult {
-                    i,
-                    j,
-                    id_a: ids[i],
-                    id_b: ids[j],
-                    score_a: scores[i][j],
-                    score_b: scores[j][i],
-                });
-            }
+            pairwise.push(PairResult {
+                i,
+                j,
+                id_a: ids[i],
+                id_b: ids[j],
+                score_a: a_scores[i][j],
+                score_b: b_scores[i][j],
+            });
         }
     }
 
-    // Build ranking with mean, median, wins/losses/draws
+    // Ranking: match WL Code-02.nb TournamentScoreboard convention.
+    // Both perspectives, Mean-aggregated over rounds, 2*n games per player.
+    // a_scores[i][j] = player i's payoff as A when i plays A against j as B
+    // b_scores[i][j] = player j's payoff as B when i plays A against j as B
+    let r = rounds as f64;
     let mut ranking: Vec<RankEntry> = ids
         .iter()
         .enumerate()
         .map(|(i, &id)| {
-            let opponents: Vec<i64> = (0..n).filter(|&j| j != i).map(|j| scores[i][j]).collect();
-            let total: i64 = opponents.iter().sum();
-            let mean = if opponents.is_empty() { 0.0 } else { total as f64 / opponents.len() as f64 };
-            let median = compute_median(&opponents);
             let mut wins = 0usize;
             let mut losses = 0usize;
             let mut draws = 0usize;
+            let mut total_payoff = 0.0f64;
+
             for j in 0..n {
-                if j == i { continue; }
-                if scores[i][j] > scores[j][i] { wins += 1; }
-                else if scores[i][j] < scores[j][i] { losses += 1; }
+                // Pair (i, j): i is player A, j is player B
+                let pay_i_as_a = a_scores[i][j] as f64 / r;
+                let pay_j_as_b = b_scores[i][j] as f64 / r;
+                let margin = pay_i_as_a - pay_j_as_b;
+                total_payoff += pay_i_as_a;
+                if margin > 0.0 { wins += 1; }
+                else if margin < 0.0 { losses += 1; }
+                else { draws += 1; }
+
+                // Pair (j, i): i is player B, j is player A
+                // i's payoff as B = b_scores[j][i] (j plays A, i plays B)
+                // j's payoff as A = a_scores[j][i]
+                let pay_i_as_b = b_scores[j][i] as f64 / r;
+                let pay_j_as_a = a_scores[j][i] as f64 / r;
+                let margin_b = pay_i_as_b - pay_j_as_a;
+                total_payoff += pay_i_as_b;
+                if margin_b > 0.0 { wins += 1; }
+                else if margin_b < 0.0 { losses += 1; }
                 else { draws += 1; }
             }
-            RankEntry { id, total, mean, median, wins, losses, draws }
+
+            let games = 2 * n;
+            let mean = total_payoff / games as f64;
+            // For median: collect per-game payoffs from all games
+            let mut per_game: Vec<f64> = Vec::with_capacity(games);
+            for j in 0..n {
+                per_game.push(a_scores[i][j] as f64 / r); // as player A in (i, j)
+                per_game.push(b_scores[j][i] as f64 / r); // as player B in (j, i)
+            }
+            per_game.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = if per_game.is_empty() {
+                0.0
+            } else if per_game.len() % 2 == 0 {
+                (per_game[per_game.len() / 2 - 1] + per_game[per_game.len() / 2]) / 2.0
+            } else {
+                per_game[per_game.len() / 2]
+            };
+
+            // raw_total = sum of payoffs as A + sum of payoffs as B
+            let raw_total: i64 = (0..n).map(|j| a_scores[i][j] + b_scores[j][i]).sum();
+            RankEntry { id, total: raw_total, mean, median, wins, losses, draws }
         })
         .collect();
-    ranking.sort_by(|a, b| b.total.cmp(&a.total));
+    ranking.sort_by(|a, b| b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal));
 
     TournamentOutput {
         ids: ids.to_vec(),
@@ -446,8 +541,9 @@ pub fn build_output(
         states,
         symbols,
         num_machines: n,
-        num_pairs: n * (n - 1),
-        scores,
+        num_pairs: n * n,
+        scores: a_scores,
+        b_scores,
         pairwise,
         ranking,
     }
@@ -525,6 +621,7 @@ pub struct MixedTournamentOutput {
     pub num_strategies: usize,
     pub num_pairs: usize,
     pub scores: Vec<Vec<i64>>,
+    pub b_scores: Vec<Vec<i64>>,
     pub pairwise: Vec<MixedPairResult>,
     pub ranking: Vec<MixedRankEntry>,
 }
@@ -551,13 +648,15 @@ pub struct MixedRankEntry {
 }
 
 /// Run a mixed-strategy tournament on CPU using rayon.
-/// Returns (survivor_indices, score_matrix) where the matrix only contains
+/// Returns (survivor_indices, a_scores, b_scores) where the matrices only contain
 /// strategies that halted on every input. Non-halting strategies are excluded.
+/// a_scores[i][j] = player i's payoff as A when i plays A against j as B.
+/// b_scores[i][j] = player j's payoff as B when i plays A against j as B.
 pub fn run_mixed_tournament_cpu(
     specs: &[StrategySpec],
     rounds: u32,
     payoff: &DynPayoff,
-) -> (Vec<usize>, Vec<Vec<i64>>) {
+) -> (Vec<usize>, Vec<Vec<i64>>, Vec<Vec<i64>>) {
     // Set num_actions on each spec from the payoff
     let mut specs = specs.to_vec();
     for spec in &mut specs {
@@ -620,55 +719,57 @@ pub fn run_mixed_tournament_cpu(
     let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
     let m = survivors.len();
 
-    // Build compact score matrix with only survivors
-    let mut matrix = vec![vec![0i64; m]; m];
+    // Build compact score matrices with only survivors
+    let mut a_matrix = vec![vec![0i64; m]; m];
+    let mut b_matrix = vec![vec![0i64; m]; m];
     for ((i, j), result) in &results {
-        if let Some((sa, _sb)) = result {
+        if let Some((sa, sb)) = result {
             if !failed.contains(i) && !failed.contains(j) {
                 let si = survivors.iter().position(|&x| x == *i).unwrap();
                 let sj = survivors.iter().position(|&x| x == *j).unwrap();
-                matrix[si][sj] = *sa;
+                a_matrix[si][sj] = *sa;
+                b_matrix[si][sj] = *sb;
             }
         }
     }
 
-    // Return only surviving specs and the compact matrix
-    (survivors, matrix)
+    // Return only surviving specs and the compact matrices
+    (survivors, a_matrix, b_matrix)
 }
 
 /// Build output for a mixed-strategy tournament.
+/// a_scores[i][j] = player i's payoff as A when i plays A against j as B.
+/// b_scores[i][j] = player j's payoff as B when i plays A against j as B.
 pub fn build_mixed_output(
     specs: &[StrategySpec],
-    scores: Vec<Vec<i64>>,
+    a_scores: Vec<Vec<i64>>,
+    b_scores: Vec<Vec<i64>>,
     rounds: u32,
     game: &str,
 ) -> MixedTournamentOutput {
     let n = specs.len();
     let labels: Vec<String> = specs.iter().map(|s| s.label()).collect();
 
-    // Pairwise results
-    let mut pairwise = Vec::with_capacity(n * (n - 1));
+    // Pairwise results (all ordered pairs including self-play)
+    let mut pairwise = Vec::with_capacity(n * n);
     for i in 0..n {
         for j in 0..n {
-            if i != j {
-                pairwise.push(MixedPairResult {
-                    i,
-                    j,
-                    label_a: labels[i].clone(),
-                    label_b: labels[j].clone(),
-                    score_a: scores[i][j],
-                    score_b: scores[j][i],
-                });
-            }
+            pairwise.push(MixedPairResult {
+                i,
+                j,
+                label_a: labels[i].clone(),
+                label_b: labels[j].clone(),
+                score_a: a_scores[i][j],
+                score_b: b_scores[i][j],
+            });
         }
     }
 
     // Ranking: match WL Code-02.nb TournamentScoreboard convention.
-    // Each ordered pair (i, j) from Tuples contributes one game to BOTH players.
-    // Player i (as A) gets payoff scores[i][j]. Player j (as B) gets payoff scores[j][i]
-    // (by symmetry of the Rust game engine). The payoff is Mean-aggregated over rounds.
+    // a_scores[i][j] = player i's payoff as A when i plays A against j as B
+    // b_scores[i][j] = player j's payoff as B when i plays A against j as B
     // Win/loss is determined by Sign(payoff_A - payoff_B) per pair.
-    // Each FSM has 2*n games (n as player A, n as player B including self-play).
+    // Each strategy has 2*n games (n as player A, n as player B including self-play).
     let r = rounds as f64;
     let mut ranking: Vec<MixedRankEntry> = labels
         .iter()
@@ -681,19 +782,19 @@ pub fn build_mixed_output(
 
             for j in 0..n {
                 // Pair (i, j): i is player A, j is player B
-                let pay_a = scores[i][j] as f64 / r; // Mean payoff for player A (i)
-                let pay_b = scores[j][i] as f64 / r; // Mean payoff for player B (j), by symmetry
-                let margin = pay_a - pay_b;
-                total_payoff += pay_a;
+                let pay_i_as_a = a_scores[i][j] as f64 / r;
+                let pay_j_as_b = b_scores[i][j] as f64 / r;
+                let margin = pay_i_as_a - pay_j_as_b;
+                total_payoff += pay_i_as_a;
                 if margin > 0.0 { wins += 1; }
                 else if margin < 0.0 { losses += 1; }
                 else { draws += 1; }
 
                 // Pair (j, i): i is player B, j is player A
-                // By symmetry, i's payoff as B = scores[i][j] / r (same as when A)
-                // j's payoff as A = scores[j][i] / r
-                let pay_i_as_b = scores[i][j] as f64 / r;
-                let pay_j_as_a = scores[j][i] as f64 / r;
+                // i's payoff as B = b_scores[j][i] (j plays A, i plays B)
+                // j's payoff as A = a_scores[j][i]
+                let pay_i_as_b = b_scores[j][i] as f64 / r;
+                let pay_j_as_a = a_scores[j][i] as f64 / r;
                 let margin_b = pay_i_as_b - pay_j_as_a;
                 total_payoff += pay_i_as_b;
                 if margin_b > 0.0 { wins += 1; }
@@ -703,11 +804,11 @@ pub fn build_mixed_output(
 
             let games = 2 * n;
             let mean = total_payoff / games as f64;
-            // For median, use per-game Mean-aggregated payoffs from all games
+            // For median: collect per-game payoffs from all games
             let mut per_game: Vec<f64> = Vec::with_capacity(games);
             for j in 0..n {
-                per_game.push(scores[i][j] as f64 / r); // as player A
-                per_game.push(scores[i][j] as f64 / r); // as player B (symmetric)
+                per_game.push(a_scores[i][j] as f64 / r); // as player A in (i, j)
+                per_game.push(b_scores[j][i] as f64 / r); // as player B in (j, i)
             }
             per_game.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = if per_game.is_empty() {
@@ -718,8 +819,8 @@ pub fn build_mixed_output(
                 per_game[per_game.len() / 2]
             };
 
-            // total in the JSON is the raw sum (not Mean-aggregated) for backward compat
-            let raw_total: i64 = (0..n).map(|j| scores[i][j]).sum();
+            // raw_total = sum of payoffs as A + sum of payoffs as B
+            let raw_total: i64 = (0..n).map(|j| a_scores[i][j] + b_scores[j][i]).sum();
             MixedRankEntry {
                 label: label.clone(),
                 total: raw_total,
@@ -738,8 +839,9 @@ pub fn build_mixed_output(
         rounds,
         game: game.to_string(),
         num_strategies: n,
-        num_pairs: n * (n - 1),
-        scores,
+        num_pairs: n * n,
+        scores: a_scores,
+        b_scores,
         pairwise,
         ranking,
     }
@@ -817,15 +919,15 @@ mod tests {
 
     #[test]
     fn all_pairs_count() {
-        assert_eq!(all_pairs(3).len(), 6); // 3 * 2
-        assert_eq!(all_pairs(5).len(), 20); // 5 * 4
+        assert_eq!(all_pairs(3).len(), 9); // 3 * 3 (includes self-play)
+        assert_eq!(all_pairs(5).len(), 25); // 5 * 5
     }
 
     #[test]
-    fn all_pairs_no_self() {
-        for (i, j) in all_pairs(4) {
-            assert_ne!(i, j);
-        }
+    fn all_pairs_includes_self() {
+        let pairs = all_pairs(4);
+        let self_pairs: Vec<_> = pairs.iter().filter(|(i, j)| i == j).collect();
+        assert_eq!(self_pairs.len(), 4); // one self-play per machine
     }
 
     #[test]
@@ -888,23 +990,28 @@ mod tests {
         // Run a tiny tournament with 3 known-halting TMs
         let ids = vec![64, 65, 192];
         let payoff = parse_game_dyn("pd").unwrap();
-        let (survivors, scores) = run_tournament_cpu(&ids, 2, 2, 500, 10, &payoff);
+        let (survivors, a_scores, b_scores) = run_tournament_cpu(&ids, 2, 2, 500, 10, &payoff);
         let m = survivors.len();
-        assert_eq!(scores.len(), m);
-        assert_eq!(scores[0].len(), m);
-        // Diagonal should be 0 (no self-play in pairs)
+        assert_eq!(a_scores.len(), m);
+        assert_eq!(b_scores.len(), m);
+        assert_eq!(a_scores[0].len(), m);
+        assert_eq!(b_scores[0].len(), m);
+        // With self-play (Tuples convention), diagonal may be non-zero
+        // Just verify the matrix dimensions are correct
         for i in 0..m {
-            assert_eq!(scores[i][i], 0, "diagonal scores[{}][{}] should be 0", i, i);
+            assert_eq!(a_scores[i].len(), m);
+            assert_eq!(b_scores[i].len(), m);
         }
     }
 
     #[test]
     fn tournament_output_ranking_sorted() {
         let ids = vec![64, 65];
-        let scores = vec![vec![0, -10], vec![-5, 0]];
-        let output = build_output(&ids, scores, 10, "pd", 2, 2);
-        // Ranking should be sorted by total descending
-        assert!(output.ranking[0].total >= output.ranking[1].total);
+        let a_scores = vec![vec![0, -10], vec![-5, 0]];
+        let b_scores = vec![vec![0, -5], vec![-10, 0]];
+        let output = build_output(&ids, a_scores, b_scores, 10, "pd", 2, 2);
+        // Ranking should be sorted by mean descending
+        assert!(output.ranking[0].mean >= output.ranking[1].mean);
     }
 
     // ── Mixed tournament tests ───────────────────────────────────────────
@@ -940,11 +1047,15 @@ mod tests {
             StrategySpec::Tm { id: 65, s: 2, k: 2, max_steps: 500, num_actions: 2 },
         ];
         let payoff = parse_game_dyn("pd").unwrap();
-        let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
+        let (survivors, a_scores, b_scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
         assert_eq!(survivors.len(), 2); // both TMs halt
-        assert_eq!(scores.len(), 2);
-        assert_eq!(scores[0][0], 0);
-        assert_eq!(scores[1][1], 0);
+        assert_eq!(a_scores.len(), 2);
+        assert_eq!(b_scores.len(), 2);
+        // With self-play, diagonal is non-zero (self vs self game)
+        assert_eq!(a_scores[0].len(), 2);
+        assert_eq!(a_scores[1].len(), 2);
+        assert_eq!(b_scores[0].len(), 2);
+        assert_eq!(b_scores[1].len(), 2);
     }
 
     #[test]
@@ -954,10 +1065,12 @@ mod tests {
             StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
         ];
         let payoff = parse_game_dyn("pd").unwrap();
-        let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
+        let (survivors, a_scores, b_scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
         assert_eq!(survivors.len(), 2); // FSMs always halt
-        assert_eq!(scores[0][1], -30);
-        assert_eq!(scores[1][0], 0);
+        // FSM id=1 cooperates (action 1%2=1 -> defect? or cooperate?)
+        // a_scores[0][1] = player 0's score as A vs player 1 as B
+        assert_eq!(a_scores[0][1], -30);
+        assert_eq!(a_scores[1][0], 0);
     }
 
     #[test]
@@ -968,11 +1081,13 @@ mod tests {
             StrategySpec::Ca { rule: 110, k: 2, r: 1.0, t: 2, num_actions: 2 },
         ];
         let payoff = parse_game_dyn("pd").unwrap();
-        let (survivors, scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
+        let (survivors, a_scores, b_scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
         assert_eq!(survivors.len(), 3); // all halt
-        assert_eq!(scores.len(), 3);
+        assert_eq!(a_scores.len(), 3);
+        assert_eq!(b_scores.len(), 3);
         for i in 0..3 {
-            assert_eq!(scores[i][i], 0);
+            assert_eq!(a_scores[i].len(), 3);
+            assert_eq!(b_scores[i].len(), 3);
         }
     }
 
@@ -982,8 +1097,9 @@ mod tests {
             StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
             StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 },
         ];
-        let scores = vec![vec![0, -30], vec![0, 0]];
-        let output = build_mixed_output(&specs, scores, 10, "pd");
-        assert!(output.ranking[0].total >= output.ranking[1].total);
+        let a_scores = vec![vec![0, -30], vec![0, 0]];
+        let b_scores = vec![vec![0, 0], vec![-30, 0]];
+        let output = build_mixed_output(&specs, a_scores, b_scores, 10, "pd");
+        assert!(output.ranking[0].mean >= output.ranking[1].mean);
     }
 }

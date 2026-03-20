@@ -195,12 +195,10 @@ struct GameParams {
     uint _pad[2];
 };
 
-// Run a TM on history bits as tape. Returns move (output_symbol % num_actions),
-// or num_actions (sentinel = non-halt) on timeout.
-// Tape layout: [0 0 ... 0 | history[0] ... history[hist_len-1]]
-//               ^left_pad
-// Head starts at rightmost history bit.
-// Halts = move right past last position.
+// Run a TM on history with leading zeros stripped (matches WL FromDigits→IntegerDigits).
+// The FromDigits→IntegerDigits roundtrip is equivalent to stripping leading zeros.
+// This avoids 64-bit overflow for long histories (200+ binary digits).
+// Returns move (output_symbol % num_actions), or num_actions (sentinel = non-halt) on timeout.
 uint run_tm_inline(
     device const GpuTransition* trans,
     uint k,
@@ -209,29 +207,41 @@ uint run_tm_inline(
     uint max_steps,
     uint num_actions)
 {
-    const uint NONHALT = num_actions; // sentinel: value >= num_actions means non-halt
-
-    // Allocate tape with left padding in thread-local memory
+    const uint NONHALT = num_actions;
     const uint MAX_TM_TAPE = 4096;
     uchar tape[MAX_TM_TAPE];
 
-    uint left_pad = min(max_steps + 1, MAX_TM_TAPE - hist_len - 1);
-    uint tape_len = left_pad + hist_len;
+    // Strip leading zeros (equivalent to FromDigits → IntegerDigits roundtrip)
+    uint start = 0;
+    while (start < hist_len && history[start] == 0) start++;
+
+    uint num_digits;
+    if (start >= hist_len) {
+        // All zeros or empty → tape is [0]
+        num_digits = 1;
+    } else {
+        num_digits = hist_len - start;
+    }
+
+    uint left_pad = min(max_steps + 1, MAX_TM_TAPE - num_digits - 1);
+    uint tape_len = left_pad + num_digits;
 
     if (tape_len > MAX_TM_TAPE) {
         return NONHALT;
     }
 
-    // Zero the left padding
     for (uint i = 0; i < left_pad; i++) {
         tape[i] = 0;
     }
-    // Copy history bits as tape data
-    for (uint i = 0; i < hist_len; i++) {
-        tape[left_pad + i] = history[i];
+    if (start >= hist_len) {
+        tape[left_pad] = 0;
+    } else {
+        for (uint i = 0; i < num_digits; i++) {
+            tape[left_pad + i] = history[start + i];
+        }
     }
 
-    uint head = tape_len - 1; // rightmost history bit
+    uint head = tape_len - 1;
     uint state = 1;
 
     for (uint step = 0; step < max_steps; step++) {
@@ -649,13 +659,11 @@ kernel void tm_tournament(
                 })
                 .collect();
 
-            // Build all ordered pairs (i, j) where i != j
-            let mut pairs: Vec<[u32; 2]> = Vec::with_capacity(n * (n - 1));
+            // Build all ordered pairs including self-play (matches WL Tuples[list, 2])
+            let mut pairs: Vec<[u32; 2]> = Vec::with_capacity(n * n);
             for i in 0..n {
                 for j in 0..n {
-                    if i != j {
-                        pairs.push([i as u32, j as u32]);
-                    }
+                    pairs.push([i as u32, j as u32]);
                 }
             }
             let num_pairs = pairs.len();
@@ -748,19 +756,17 @@ kernel void tm_tournament(
             let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
             let m = survivors.len();
 
-            // Build compact score matrix with only survivors
+            // Build compact score matrix with only survivors (pairs include self-play)
             let mut matrix = vec![vec![0i64; m]; m];
             let mut pair_idx = 0;
             for i in 0..n {
                 for j in 0..n {
-                    if i != j {
-                        if !failed.contains(&i) && !failed.contains(&j) {
-                            let si = survivors.iter().position(|&x| x == i).unwrap();
-                            let sj = survivors.iter().position(|&x| x == j).unwrap();
-                            matrix[si][sj] = raw_scores[pair_idx][0] as i64;
-                        }
-                        pair_idx += 1;
+                    if !failed.contains(&i) && !failed.contains(&j) {
+                        let si = survivors.iter().position(|&x| x == i).unwrap();
+                        let sj = survivors.iter().position(|&x| x == j).unwrap();
+                        matrix[si][sj] = raw_scores[pair_idx][0] as i64;
                     }
+                    pair_idx += 1;
                 }
             }
 
@@ -958,13 +964,11 @@ kernel void ca_tournament(
                 })
                 .collect();
 
-            // Build all ordered pairs (i, j) where i != j
-            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * (n - 1));
+            // Build all ordered pairs including self-play (matches WL Tuples[list, 2])
+            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * n);
             for i in 0..n {
                 for j in 0..n {
-                    if i != j {
-                        all_pairs.push([i as u32, j as u32]);
-                    }
+                    all_pairs.push([i as u32, j as u32]);
                 }
             }
 

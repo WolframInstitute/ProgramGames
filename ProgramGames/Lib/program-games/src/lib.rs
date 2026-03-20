@@ -75,6 +75,16 @@ pub fn checked_pow(base: u128, exp: u32) -> Option<u128> {
     Some(result)
 }
 
+/// Convert MSD-first base-k digit list to integer (matches WL FromDigits[list, base]).
+pub fn from_digits(digits: &[u8], base: u8) -> u64 {
+    let base = base.max(2) as u64;
+    let mut value = 0u64;
+    for &d in digits {
+        value = value.wrapping_mul(base).wrapping_add(d as u64);
+    }
+    value
+}
+
 /// Convert integer to MSD-first base-k digits.
 pub fn digits_in_base(mut value: u64, base: u8) -> Vec<u8> {
     let base = base.max(2) as u64;
@@ -755,7 +765,8 @@ pub fn tm_tournament_wl(
     }
 
     let survivors: Vec<usize>;
-    let scores: Vec<Vec<i64>>;
+    let a_scores: Vec<Vec<i64>>;
+    let b_scores: Vec<Vec<i64>>;
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
@@ -764,33 +775,39 @@ pub fn tm_tournament_wl(
                 &ids, states, symbols, max_steps, rounds,
                 dyn_payoff.num_actions as u32, &dyn_payoff.entries,
             ) {
-                Ok((s, sc)) => { survivors = s; scores = sc; }
-                Err(_e) => {
-                    let (s, sc) = tournament::run_tournament_cpu(
+                Ok((_s, _sc)) => {
+                    // GPU only returns a_scores; fall back to CPU for full scoring
+                    let (s2, asc, bsc) = tournament::run_tournament_cpu(
                         &ids, states, symbols, max_steps, rounds, &dyn_payoff,
                     );
-                    survivors = s; scores = sc;
+                    survivors = s2; a_scores = asc; b_scores = bsc;
+                }
+                Err(_e) => {
+                    let (s, asc, bsc) = tournament::run_tournament_cpu(
+                        &ids, states, symbols, max_steps, rounds, &dyn_payoff,
+                    );
+                    survivors = s; a_scores = asc; b_scores = bsc;
                 }
             };
         } else {
-            let (s, sc) = tournament::run_tournament_cpu(
+            let (s, asc, bsc) = tournament::run_tournament_cpu(
                 &ids, states, symbols, max_steps, rounds, &dyn_payoff,
             );
-            survivors = s; scores = sc;
+            survivors = s; a_scores = asc; b_scores = bsc;
         }
     }
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let _ = use_gpu;
-        let (s, sc) = tournament::run_tournament_cpu(
+        let (s, asc, bsc) = tournament::run_tournament_cpu(
             &ids, states, symbols, max_steps, rounds, &dyn_payoff,
         );
-        survivors = s; scores = sc;
+        survivors = s; a_scores = asc; b_scores = bsc;
     }
 
     let survivor_ids: Vec<u64> = survivors.iter().map(|&i| ids[i]).collect();
 
-    let output = tournament::build_output(&survivor_ids, scores, rounds, &game, states, symbols);
+    let output = tournament::build_output(&survivor_ids, a_scores, b_scores, rounds, &game, states, symbols);
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -818,9 +835,9 @@ pub fn program_tournament_wl(
         return "{\"error\":\"no strategies provided\"}".to_string();
     }
 
-    let (survivors, scores) = tournament::run_mixed_tournament_cpu(&specs, rounds, &payoff);
+    let (survivors, a_scores, b_scores) = tournament::run_mixed_tournament_cpu(&specs, rounds, &payoff);
     let surviving_specs: Vec<_> = survivors.iter().map(|&i| specs[i].clone()).collect();
-    let output = tournament::build_mixed_output(&surviving_specs, scores, rounds, &game);
+    let output = tournament::build_mixed_output(&surviving_specs, a_scores, b_scores, rounds, &game);
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -866,7 +883,8 @@ pub fn ca_tournament_wl(
         return "{\"error\":\"no CA rules provided\"}".to_string();
     }
 
-    let scores: Vec<Vec<i64>>;
+    let a_scores: Vec<Vec<i64>>;
+    let b_scores: Vec<Vec<i64>>;
     let used_gpu: bool;
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -876,30 +894,37 @@ pub fn ca_tournament_wl(
                 &rule_ids, k, two_r, t, rounds,
                 dyn_payoff.num_actions as u32, &dyn_payoff.entries,
             ) {
-                Ok(s) => {
-                    scores = s;
-                    used_gpu = true;
-                }
-                Err(_e) => {
-                    scores = run_ca_tournament_cpu(
+                Ok(_s) => {
+                    // GPU only returns a_scores; fall back to CPU for full scoring
+                    let (asc, bsc) = run_ca_tournament_cpu(
                         &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
                     );
+                    a_scores = asc; b_scores = bsc;
+                    used_gpu = false;
+                }
+                Err(_e) => {
+                    let (asc, bsc) = run_ca_tournament_cpu(
+                        &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
+                    );
+                    a_scores = asc; b_scores = bsc;
                     used_gpu = false;
                 }
             };
         } else {
-            scores = run_ca_tournament_cpu(
+            let (asc, bsc) = run_ca_tournament_cpu(
                 &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
             );
+            a_scores = asc; b_scores = bsc;
             used_gpu = false;
         }
     }
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let _ = use_gpu;
-        scores = run_ca_tournament_cpu(
+        let (asc, bsc) = run_ca_tournament_cpu(
             &rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions,
         );
+        a_scores = asc; b_scores = bsc;
         used_gpu = false;
     }
 
@@ -908,13 +933,16 @@ pub fn ca_tournament_wl(
         .iter()
         .map(|&rule| strategy::StrategySpec::Ca { rule, k, r: r_f, t, num_actions })
         .collect();
-    let output = tournament::build_mixed_output(&specs, scores, rounds, &game);
+    let output = tournament::build_mixed_output(&specs, a_scores, b_scores, rounds, &game);
     let mut json_val = serde_json::to_value(&output).unwrap_or(serde_json::json!({}));
     json_val["gpu"] = serde_json::json!(used_gpu);
     serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// CPU fallback for CA tournament using Rayon.
+/// Returns (a_scores, b_scores) where:
+/// a_scores[i][j] = player i's payoff as A when i plays A against j as B
+/// b_scores[i][j] = player j's payoff as B when i plays A against j as B
 fn run_ca_tournament_cpu(
     rule_ids: &[u64],
     k: u8,
@@ -923,7 +951,7 @@ fn run_ca_tournament_cpu(
     rounds: u32,
     payoff: &tournament::DynPayoff,
     num_actions: u8,
-) -> Vec<Vec<i64>> {
+) -> (Vec<Vec<i64>>, Vec<Vec<i64>>) {
     let n = rule_ids.len();
     let r_f = two_r as f32 / 2.0;
     let specs: Vec<strategy::StrategySpec> = rule_ids
@@ -933,25 +961,27 @@ fn run_ca_tournament_cpu(
 
     // Play all ordered pairs in parallel
     let pairs: Vec<(usize, usize)> = (0..n)
-        .flat_map(|i| (0..n).filter(move |&j| i != j).map(move |j| (i, j)))
+        .flat_map(|i| (0..n).map(move |j| (i, j)))
         .collect();
 
-    let pair_scores: Vec<(usize, usize, i64)> = pairs
+    let pair_scores: Vec<(usize, usize, i64, i64)> = pairs
         .into_par_iter()
         .map(|(i, j)| {
             let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
             let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
             let (result, _) = strategy::play_game_dyn(&mut runner_a, &mut runner_b, rounds, payoff);
-            let score_a = result.map(|(sa, _)| sa).unwrap_or(0);
-            (i, j, score_a)
+            let (score_a, score_b) = result.unwrap_or((0, 0));
+            (i, j, score_a, score_b)
         })
         .collect();
 
-    let mut matrix = vec![vec![0i64; n]; n];
-    for (i, j, score) in pair_scores {
-        matrix[i][j] = score;
+    let mut a_matrix = vec![vec![0i64; n]; n];
+    let mut b_matrix = vec![vec![0i64; n]; n];
+    for (i, j, sa, sb) in pair_scores {
+        a_matrix[i][j] = sa;
+        b_matrix[i][j] = sb;
     }
-    matrix
+    (a_matrix, b_matrix)
 }
 
 /// Run a RuleArray tournament (CPU only).
@@ -1000,26 +1030,28 @@ pub fn rule_array_tournament_wl(
 
     let n = specs.len();
     let pairs: Vec<(usize, usize)> = (0..n)
-        .flat_map(|i| (0..n).filter(move |&j| i != j).map(move |j| (i, j)))
+        .flat_map(|i| (0..n).map(move |j| (i, j)))
         .collect();
 
-    let pair_scores: Vec<(usize, usize, i64)> = pairs
+    let pair_scores: Vec<(usize, usize, i64, i64)> = pairs
         .into_par_iter()
         .map(|(i, j)| {
             let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
             let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
             let (result, _) = strategy::play_game_dyn(&mut runner_a, &mut runner_b, rounds, &dyn_payoff);
-            let score_a = result.map(|(sa, _)| sa).unwrap_or(0);
-            (i, j, score_a)
+            let (score_a, score_b) = result.unwrap_or((0, 0));
+            (i, j, score_a, score_b)
         })
         .collect();
 
-    let mut scores = vec![vec![0i64; n]; n];
-    for (i, j, score) in pair_scores {
-        scores[i][j] = score;
+    let mut a_scores = vec![vec![0i64; n]; n];
+    let mut b_scores = vec![vec![0i64; n]; n];
+    for (i, j, sa, sb) in pair_scores {
+        a_scores[i][j] = sa;
+        b_scores[i][j] = sb;
     }
 
-    let output = tournament::build_mixed_output(&specs, scores, rounds, &game);
+    let output = tournament::build_mixed_output(&specs, a_scores, b_scores, rounds, &game);
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -1239,7 +1271,8 @@ pub fn fsm_tournament_wl(
         return "{\"error\":\"no FSM IDs provided\"}".to_string();
     }
 
-    let scores: Vec<Vec<i64>>;
+    let a_scores: Vec<Vec<i64>>;
+    let b_scores: Vec<Vec<i64>>;
     let used_gpu: bool;
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1249,30 +1282,37 @@ pub fn fsm_tournament_wl(
                 &fsm_ids, states, symbols, rounds,
                 dyn_payoff.num_actions as u32, &dyn_payoff.entries,
             ) {
-                Ok(s) => {
-                    scores = s;
-                    used_gpu = true;
-                }
-                Err(_e) => {
-                    scores = run_fsm_tournament_cpu(
+                Ok(_s) => {
+                    // GPU only returns a_scores; fall back to CPU for full scoring
+                    let (asc, bsc) = run_fsm_tournament_cpu(
                         &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
                     );
+                    a_scores = asc; b_scores = bsc;
+                    used_gpu = false;
+                }
+                Err(_e) => {
+                    let (asc, bsc) = run_fsm_tournament_cpu(
+                        &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
+                    );
+                    a_scores = asc; b_scores = bsc;
                     used_gpu = false;
                 }
             };
         } else {
-            scores = run_fsm_tournament_cpu(
+            let (asc, bsc) = run_fsm_tournament_cpu(
                 &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
             );
+            a_scores = asc; b_scores = bsc;
             used_gpu = false;
         }
     }
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let _ = use_gpu;
-        scores = run_fsm_tournament_cpu(
+        let (asc, bsc) = run_fsm_tournament_cpu(
             &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
         );
+        a_scores = asc; b_scores = bsc;
         used_gpu = false;
     }
 
@@ -1286,13 +1326,16 @@ pub fn fsm_tournament_wl(
             num_actions,
         })
         .collect();
-    let output = tournament::build_mixed_output(&specs, scores, rounds, &game);
+    let output = tournament::build_mixed_output(&specs, a_scores, b_scores, rounds, &game);
     let mut json_val = serde_json::to_value(&output).unwrap_or(serde_json::json!({}));
     json_val["gpu"] = serde_json::json!(used_gpu);
     serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// CPU fallback for FSM tournament using Rayon.
+/// Returns (a_scores, b_scores) where:
+/// a_scores[i][j] = player i's payoff as A when i plays A against j as B
+/// b_scores[i][j] = player j's payoff as B when i plays A against j as B
 fn run_fsm_tournament_cpu(
     fsm_ids: &[u64],
     states: usize,
@@ -1300,7 +1343,7 @@ fn run_fsm_tournament_cpu(
     rounds: u32,
     payoff: &tournament::DynPayoff,
     num_actions: u8,
-) -> Vec<Vec<i64>> {
+) -> (Vec<Vec<i64>>, Vec<Vec<i64>>) {
     let n = fsm_ids.len();
     let specs: Vec<strategy::StrategySpec> = fsm_ids
         .iter()
@@ -1317,22 +1360,24 @@ fn run_fsm_tournament_cpu(
         .flat_map(|i| (0..n).map(move |j| (i, j)))
         .collect();
 
-    let pair_scores: Vec<(usize, usize, i64)> = pairs
+    let pair_scores: Vec<(usize, usize, i64, i64)> = pairs
         .into_par_iter()
         .map(|(i, j)| {
             let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
             let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
             let (result, _) = strategy::play_game_dyn(&mut runner_a, &mut runner_b, rounds, payoff);
-            let score_a = result.map(|(sa, _)| sa).unwrap_or(0);
-            (i, j, score_a)
+            let (score_a, score_b) = result.unwrap_or((0, 0));
+            (i, j, score_a, score_b)
         })
         .collect();
 
-    let mut matrix = vec![vec![0i64; n]; n];
-    for (i, j, score) in pair_scores {
-        matrix[i][j] = score;
+    let mut a_matrix = vec![vec![0i64; n]; n];
+    let mut b_matrix = vec![vec![0i64; n]; n];
+    for (i, j, sa, sb) in pair_scores {
+        a_matrix[i][j] = sa;
+        b_matrix[i][j] = sb;
     }
-    matrix
+    (a_matrix, b_matrix)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1802,17 +1847,17 @@ mod tests {
         let dyn_payoff = tournament::parse_game_dyn("pd").unwrap();
         let num_actions = dyn_payoff.num_actions as u8;
 
-        let cpu_scores = run_ca_tournament_cpu(&rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions);
+        let (cpu_a_scores, _cpu_b_scores) = run_ca_tournament_cpu(&rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions);
 
         match gpu::run_ca_tournament_gpu(&rule_ids, k, two_r, t, rounds, dyn_payoff.num_actions as u32, &dyn_payoff.entries) {
             Ok(gpu_scores) => {
-                assert_eq!(gpu_scores.len(), cpu_scores.len());
+                assert_eq!(gpu_scores.len(), cpu_a_scores.len());
                 for i in 0..rule_ids.len() {
                     for j in 0..rule_ids.len() {
                         assert_eq!(
-                            gpu_scores[i][j], cpu_scores[i][j],
+                            gpu_scores[i][j], cpu_a_scores[i][j],
                             "Score mismatch at [{},{}]: GPU={} CPU={}",
-                            i, j, gpu_scores[i][j], cpu_scores[i][j]
+                            i, j, gpu_scores[i][j], cpu_a_scores[i][j]
                         );
                     }
                 }
@@ -1835,16 +1880,16 @@ mod tests {
         let dyn_payoff = tournament::parse_game_dyn("pd").unwrap();
         let num_actions = dyn_payoff.num_actions as u8;
 
-        let cpu_scores = run_fsm_tournament_cpu(
+        let (cpu_a_scores, _cpu_b_scores) = run_fsm_tournament_cpu(
             &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
         );
 
         // Verify CPU scores are non-zero
-        let cpu_nonzero = cpu_scores.iter()
+        let cpu_nonzero = cpu_a_scores.iter()
             .flat_map(|row| row.iter())
             .any(|&s| s != 0);
         assert!(cpu_nonzero, "CPU FSM tournament should have non-zero scores");
-        eprintln!("  CPU scores (first row): {:?}", &cpu_scores[0]);
+        eprintln!("  CPU scores (first row): {:?}", &cpu_a_scores[0]);
 
         match gpu::run_fsm_tournament_gpu(
             &fsm_ids, states, symbols, rounds,
@@ -1857,13 +1902,13 @@ mod tests {
                     .any(|&s| s != 0);
                 assert!(gpu_nonzero, "GPU FSM tournament should have non-zero scores");
 
-                assert_eq!(gpu_scores.len(), cpu_scores.len());
+                assert_eq!(gpu_scores.len(), cpu_a_scores.len());
                 for i in 0..fsm_ids.len() {
                     for j in 0..fsm_ids.len() {
                         assert_eq!(
-                            gpu_scores[i][j], cpu_scores[i][j],
+                            gpu_scores[i][j], cpu_a_scores[i][j],
                             "Score mismatch at [{},{}]: GPU={} CPU={}",
-                            i, j, gpu_scores[i][j], cpu_scores[i][j]
+                            i, j, gpu_scores[i][j], cpu_a_scores[i][j]
                         );
                     }
                 }
@@ -1963,3 +2008,4 @@ mod tests {
         eprintln!();
     }
 }
+

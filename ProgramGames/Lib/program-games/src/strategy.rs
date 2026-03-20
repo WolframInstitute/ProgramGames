@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use crate::tournament::{run_tm_on_tape, DynPayoff, Payoff};
+use crate::tournament::{DynPayoff, Payoff};
 use crate::TmTransition;
 
 // ── Strategy specification (JSON-deserializable) ─────────────────────────────
@@ -201,8 +201,40 @@ impl StrategyRunner {
                 if round == 0 {
                     return Some(0); // cooperate on empty history
                 }
-                let (halted, output) =
-                    run_tm_on_tape(transitions, *symbols, history, *max_steps);
+                // Strip leading zeros from history (equivalent to WL FromDigits→IntegerDigits)
+                // and run TM with the result as tape. Avoids u64 overflow for long histories.
+                let start = history.iter().position(|&d| d != 0).unwrap_or(history.len());
+                let digits: Vec<u8> = if start >= history.len() {
+                    vec![0u8]
+                } else {
+                    history[start..].to_vec()
+                };
+                let k = (*symbols).max(2);
+                let mut tape = digits;
+                let mut head: usize = tape.len().saturating_sub(1);
+                let mut tm_state: u16 = 1;
+                let mut halted = false;
+                let mut output = 0u8;
+                for _step in 0..*max_steps {
+                    let read = tape.get(head).copied().unwrap_or(0);
+                    let idx = (tm_state.saturating_sub(1) as usize) * (k as usize) + (read as usize);
+                    let Some(&trans) = transitions.get(idx) else { break; };
+                    if let Some(cell) = tape.get_mut(head) { *cell = trans.write; }
+                    if trans.move_right && head + 1 == tape.len() {
+                        output = tape.last().copied().unwrap_or(0) % 2;
+                        halted = true;
+                        break;
+                    }
+                    if trans.move_right {
+                        if head + 1 < tape.len() { head += 1; }
+                    } else if head == 0 {
+                        tape.insert(0, 0);
+                    } else {
+                        head -= 1;
+                    }
+                    tm_state = trans.next;
+                    if tm_state == 0 { break; }
+                }
                 if halted {
                     Some(output % *num_actions)
                 } else {

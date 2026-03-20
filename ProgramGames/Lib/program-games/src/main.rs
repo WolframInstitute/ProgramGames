@@ -1021,9 +1021,9 @@ fn main() {
                     eprintln!("  [{}] {}", i, spec.label());
                 }
 
-                let (survivors, scores) = tournament::run_mixed_tournament_cpu(&specs, rounds, &dyn_payoff);
+                let (survivors, a_scores, b_scores) = tournament::run_mixed_tournament_cpu(&specs, rounds, &dyn_payoff);
                 let surviving_specs: Vec<_> = survivors.iter().map(|&i| specs[i].clone()).collect();
-                let output = tournament::build_mixed_output(&surviving_specs, scores, rounds, &game);
+                let output = tournament::build_mixed_output(&surviving_specs, a_scores, b_scores, rounds, &game);
 
                 eprintln!("  done: {} strategies survived, {} pairs scored",
                           surviving_specs.len(), output.num_pairs);
@@ -1064,7 +1064,8 @@ fn main() {
 
                 // Dispatch to GPU or CPU
                 let survivors: Vec<usize>;
-                let scores: Vec<Vec<i64>>;
+                let a_scores: Vec<Vec<i64>>;
+                let b_scores: Vec<Vec<i64>>;
 
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 {
@@ -1073,20 +1074,27 @@ fn main() {
                             &tm_ids, states, symbols, max_steps, rounds,
                             dyn_payoff.num_actions as u32, &dyn_payoff.entries,
                         ) {
-                            Ok((s, sc)) => { survivors = s; scores = sc; }
-                            Err(e) => {
-                                eprintln!("  GPU tournament failed ({}), falling back to CPU", e);
-                                let (s, sc) = tournament::run_tournament_cpu(
+                            Ok((s, sc)) => {
+                                // GPU only returns a_scores; fall back to CPU for b_scores
+                                eprintln!("  GPU returned a_scores only, re-running on CPU for full scoring");
+                                let (s2, asc, bsc) = tournament::run_tournament_cpu(
                                     &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                                 );
-                                survivors = s; scores = sc;
+                                survivors = s2; a_scores = asc; b_scores = bsc;
+                            }
+                            Err(e) => {
+                                eprintln!("  GPU tournament failed ({}), falling back to CPU", e);
+                                let (s, asc, bsc) = tournament::run_tournament_cpu(
+                                    &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
+                                );
+                                survivors = s; a_scores = asc; b_scores = bsc;
                             }
                         };
                     } else {
-                        let (s, sc) = tournament::run_tournament_cpu(
+                        let (s, asc, bsc) = tournament::run_tournament_cpu(
                             &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                         );
-                        survivors = s; scores = sc;
+                        survivors = s; a_scores = asc; b_scores = bsc;
                     }
                 }
                 #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -1094,16 +1102,16 @@ fn main() {
                     if use_gpu {
                         eprintln!("  Metal not compiled in, using CPU");
                     }
-                    let (s, sc) = tournament::run_tournament_cpu(
+                    let (s, asc, bsc) = tournament::run_tournament_cpu(
                         &tm_ids, states, symbols, max_steps, rounds, &dyn_payoff,
                     );
-                    survivors = s; scores = sc;
+                    survivors = s; a_scores = asc; b_scores = bsc;
                 }
 
                 let survivor_ids: Vec<u64> = survivors.iter().map(|&i| tm_ids[i]).collect();
 
                 let output = tournament::build_output(
-                    &survivor_ids, scores, rounds, &game, states, symbols,
+                    &survivor_ids, a_scores, b_scores, rounds, &game, states, symbols,
                 );
 
                 eprintln!(
