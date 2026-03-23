@@ -184,13 +184,20 @@ jobs:
           name: cross-binaries
           path: target
 
+      - name: Install Rust (needed by CargoCollect for cargo metadata)
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
       - name: Verify Binaries
         run: |
           echo "=== Downloaded binaries ==="
           find target -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.dll" \) -exec ls -lh {} \;
 
       - name: Build Paclet
-        run: wolframscript -f ci_build.wl
+        run: |
+          . $HOME/.cargo/env
+          wolframscript -f ci_build.wl
 
       - name: Find Paclet File
         id: find_paclet
