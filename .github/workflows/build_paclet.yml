@@ -14,29 +14,74 @@ on:
     outputs:
       paclet_file:
         description: "Path to the built paclet"
-        value: ${{ jobs.build.outputs.paclet_file }}
+        value: ${{ jobs.package.outputs.paclet_file }}
       paclet_version:
         description: "Version of the built paclet"
-        value: ${{ jobs.build.outputs.paclet_version }}
+        value: ${{ jobs.package.outputs.paclet_version }}
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build Paclet
+  # Job 1: Build macOS targets natively with Metal GPU support
+  build-macos:
+    name: Build macOS (Metal GPU)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Cache Rust Toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            ~/.rustup
+          key: rust-macos-${{ hashFiles('ProgramGames/Lib/program-games/Cargo.toml', 'Cargo.toml') }}
+          restore-keys: rust-macos-
+
+      - name: Install Rust
+        run: |
+          if ! command -v rustup &> /dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Cache Cargo Build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-macos-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-macos-
+
+      - name: Build macOS Targets
+        run: |
+          source "$HOME/.cargo/env"
+          chmod +x build_macos_targets.sh
+          ./build_macos_targets.sh
+
+      - name: Upload macOS Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries
+          path: |
+            target/x86_64-apple-darwin/release/libprogram_games.dylib
+            target/aarch64-apple-darwin/release/libprogram_games.dylib
+          if-no-files-found: error
+
+  # Job 2: Cross-compile Linux and Windows targets from Linux
+  build-cross:
+    name: Build Linux/Windows
     runs-on: ubuntu-latest
     container:
       image: wolframresearch/wolframengine:latest
       options: --user root
 
-    outputs:
-      paclet_file: ${{ steps.find_paclet.outputs.paclet_file }}
-      paclet_version: ${{ steps.read_version.outputs.version }}
-
     env:
-      WOLFRAMSCRIPT_ENTITLEMENTID: ${{ secrets.WOLFRAMSCRIPT_ENTITLEMENTID }}
-      RESOURCE_PUBLISHER_TOKEN: ${{ secrets.RESOURCE_PUBLISHER_TOKEN }}
       SDKROOT: /nonexistent
 
     steps:
@@ -51,40 +96,6 @@ jobs:
           ln -sf /usr/bin/x86_64-linux-gnu-gcc /usr/bin/x86_64-unknown-linux-gnu-gcc
           ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/bin/aarch64-unknown-linux-gnu-gcc
 
-      - name: Cache Toolchains
-        if: ${{ !env.ACT }}
-        id: cache-toolchains
-        uses: actions/cache@v4
-        with:
-          path: |
-            /opt/zig
-            /opt/macos-sysroot
-            /usr/local/bin/zcc
-          key: toolchains-zig-0.13.0-libiconv-1.17-${{ hashFiles('setup_cross_compile.sh', 'zcc') }}
-
-      - name: Check Zig Cache
-        id: check-zig
-        run: |
-          if [ -f /opt/zig/zig ]; then
-            echo "hit=true" >> $GITHUB_OUTPUT
-          else
-            echo "hit=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Setup Cross-Compilation Toolchains
-        if: steps.cache-toolchains.outputs.cache-hit != 'true' && steps.check-zig.outputs.hit != 'true'
-        run: |
-          chmod +x setup_cross_compile.sh
-          ./setup_cross_compile.sh
-
-      - name: Add Zig to PATH
-        run: echo "/opt/zig" >> $GITHUB_PATH
-
-      - name: Copy zcc wrapper
-        run: |
-          cp zcc /usr/local/bin/zcc
-          chmod +x /usr/local/bin/zcc
-
       - name: Cache Rust Toolchain
         if: ${{ !env.ACT }}
         id: cache-rust
@@ -93,7 +104,7 @@ jobs:
           path: |
             ~/.cargo
             ~/.rustup
-          key: rust-${{ hashFiles('setup_rust.sh') }}
+          key: rust-cross-${{ hashFiles('setup_rust.sh') }}
 
       - name: Check Rust Cache
         id: check-rust
@@ -121,15 +132,62 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: |
-            cargo-
+          key: cargo-cross-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-cross-
 
-      - name: Build All Targets
+      - name: Build Linux/Windows Targets
         run: |
           . $HOME/.cargo/env
           chmod +x build_all_targets.sh
           ./build_all_targets.sh
+
+      - name: Upload Cross-Compiled Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-binaries
+          path: |
+            target/x86_64-unknown-linux-gnu/release/libprogram_games.so
+            target/aarch64-unknown-linux-gnu/release/libprogram_games.so
+            target/x86_64-pc-windows-gnu/release/program_games.dll
+          if-no-files-found: error
+
+  # Job 3: Combine binaries and create paclet
+  package:
+    name: Package Paclet
+    needs: [build-macos, build-cross]
+    runs-on: ubuntu-latest
+    container:
+      image: wolframresearch/wolframengine:latest
+      options: --user root
+
+    outputs:
+      paclet_file: ${{ steps.find_paclet.outputs.paclet_file }}
+      paclet_version: ${{ steps.read_version.outputs.version }}
+
+    env:
+      WOLFRAMSCRIPT_ENTITLEMENTID: ${{ secrets.WOLFRAMSCRIPT_ENTITLEMENTID }}
+      RESOURCE_PUBLISHER_TOKEN: ${{ secrets.RESOURCE_PUBLISHER_TOKEN }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download macOS Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-binaries
+          path: target
+
+      - name: Download Cross-Compiled Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-binaries
+          path: target
+
+      - name: Verify Binaries
+        run: |
+          echo "=== Downloaded binaries ==="
+          find target -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.dll" \) -exec ls -lh {} \;
 
       - name: Build Paclet
         run: wolframscript -f ci_build.wl
