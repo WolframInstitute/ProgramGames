@@ -1194,21 +1194,22 @@ fn ca_classify_group_signatures_indexed(
 /// 2. Behavioral grouping: run canonical reps through all input sequences (12 steps)
 ///    -> group by output trace -> unique behavior representatives
 ///
-/// `states`/`symbols` define the FSM space; `depth` is unused (kept for API compat,
-/// trace length is fixed at 12 like nit); `sample=0` means exhaustive, `sample>0`
-/// means random sample of that size.
+/// `states`/`symbols` define the FSM space; `depth` controls the behavioral
+/// trace length for grouping (higher = finer distinction between FSMs);
+/// `sample=0` means exhaustive, `sample>0` means random sample of that size.
 #[wll::export]
 pub fn fsm_classify_wl(
     states: i64,
     symbols: i64,
-    _depth: i64,
+    depth: i64,
     sample: i64,
 ) -> String {
     let states = states as usize;
     let symbols = symbols as usize;
     let sample = if sample > 0 { sample as usize } else { 0 };
+    let trace_steps = if depth > 0 { depth as usize } else { 12 };
 
-    match strategy::fsm_classify_two_step(states, symbols, sample) {
+    match strategy::fsm_classify_two_step(states, symbols, sample, trace_steps) {
         Ok(result) => {
             let group_entries: Vec<serde_json::Value> = result
                 .groups

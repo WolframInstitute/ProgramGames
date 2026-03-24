@@ -790,7 +790,7 @@ pub fn behavior_trace_signature(raw: &RawFsm, steps: usize) -> Vec<u16> {
     signature
 }
 
-const NOTEBOOK_BEHAVIOR_TRACE_STEPS: usize = 12;
+
 
 fn insert_min_index(map: &mut HashMap<Vec<u16>, u64>, key: Vec<u16>, idx: u64) {
     if let Some(existing) = map.get_mut(&key) {
@@ -832,6 +832,7 @@ pub fn fsm_classify_two_step(
     states: usize,
     actions: usize,
     sample: usize,
+    trace_steps: usize,
 ) -> Result<FsmClassification, String> {
     let total_rules = fsm_count(states, actions)
         .ok_or_else(|| "fsm space overflow".to_string())?;
@@ -902,7 +903,7 @@ pub fn fsm_classify_two_step(
         .par_iter()
         .try_fold(HashMap::new, |mut local: HashMap<Vec<u16>, Vec<u64>>, &idx| {
             let raw = decode_fsm_raw(idx, states, actions)?;
-            let trace = behavior_trace_signature(&raw, NOTEBOOK_BEHAVIOR_TRACE_STEPS);
+            let trace = behavior_trace_signature(&raw, trace_steps);
             local.entry(trace).or_default().push(idx);
             Ok::<_, String>(local)
         })
