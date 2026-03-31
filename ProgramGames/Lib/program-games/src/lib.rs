@@ -1283,13 +1283,9 @@ pub fn fsm_tournament_wl(
                 &fsm_ids, states, symbols, rounds,
                 dyn_payoff.num_actions as u32, &dyn_payoff.entries,
             ) {
-                Ok(_s) => {
-                    // GPU only returns a_scores; fall back to CPU for full scoring
-                    let (asc, bsc) = run_fsm_tournament_cpu(
-                        &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
-                    );
+                Ok((asc, bsc)) => {
                     a_scores = asc; b_scores = bsc;
-                    used_gpu = false;
+                    used_gpu = true;
                 }
                 Err(_e) => {
                     let (asc, bsc) = run_fsm_tournament_cpu(
@@ -1379,6 +1375,170 @@ fn run_fsm_tournament_cpu(
         b_matrix[i][j] = sb;
     }
     (a_matrix, b_matrix)
+}
+
+/// Batched FSM game survey: runs tournaments for ALL games in a single call,
+/// reusing the GPU pipeline and decoded FSM data. Much faster than calling
+/// fsm_tournament_wl once per game.
+///
+/// Returns JSON: {"results": [{"game": "...", "winner": {...}}, ...], "time": ..., "gpu": ...}
+/// Each winner has "ByTotal", "ByMean", "ByMedian" keys (or empty if tied).
+#[wll::export]
+pub fn fsm_game_survey_wl(
+    states: i64,
+    symbols: i64,
+    rounds: i64,
+    games_json: String,
+    fsm_ids_json: String,
+    use_gpu: bool,
+) -> String {
+    let states = states as usize;
+    let symbols = symbols as usize;
+    let rounds_u32 = rounds as u32;
+
+    let fsm_ids: Vec<u64> = match serde_json::from_str(&fsm_ids_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"bad fsm_ids: {}\"}}", e),
+    };
+    if fsm_ids.is_empty() {
+        return "{\"error\":\"no FSM IDs provided\"}".to_string();
+    }
+
+    // Parse games: list of comma-separated payoff strings
+    let game_strings: Vec<String> = match serde_json::from_str(&games_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"bad games: {}\"}}", e),
+    };
+    if game_strings.is_empty() {
+        return "{\"error\":\"no games provided\"}".to_string();
+    }
+
+    // Parse all payoffs
+    let mut all_dyn_payoffs = Vec::with_capacity(game_strings.len());
+    for gs in &game_strings {
+        match tournament::parse_game_dyn(gs) {
+            Ok(p) => all_dyn_payoffs.push(p),
+            Err(e) => return format!("{{\"error\":\"bad game '{}': {}\"}}", gs, e),
+        }
+    }
+    let num_actions = all_dyn_payoffs[0].num_actions;
+    let num_actions_u8 = num_actions as u8;
+
+    let t0 = std::time::Instant::now();
+
+    // Build specs for output formatting
+    let specs: Vec<strategy::StrategySpec> = fsm_ids
+        .iter()
+        .map(|&id| strategy::StrategySpec::Fsm {
+            id,
+            s: states as u16,
+            k: symbols as u8,
+            num_actions: num_actions_u8,
+        })
+        .collect();
+
+    let used_gpu: bool;
+    let all_results: Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>;
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if use_gpu {
+            let all_payoff_entries: Vec<Vec<[i32; 2]>> = all_dyn_payoffs
+                .iter()
+                .map(|p| p.entries.clone())
+                .collect();
+            match gpu::run_fsm_multi_game_gpu(
+                &fsm_ids, states, symbols, rounds_u32,
+                num_actions as u32, &all_payoff_entries,
+            ) {
+                Ok(results) => {
+                    all_results = results;
+                    used_gpu = true;
+                }
+                Err(_e) => {
+                    // Fall back to CPU
+                    all_results = all_dyn_payoffs
+                        .iter()
+                        .map(|payoff| {
+                            run_fsm_tournament_cpu(
+                                &fsm_ids, states, symbols, rounds_u32, payoff, num_actions_u8,
+                            )
+                        })
+                        .collect();
+                    used_gpu = false;
+                }
+            }
+        } else {
+            all_results = all_dyn_payoffs
+                .iter()
+                .map(|payoff| {
+                    run_fsm_tournament_cpu(
+                        &fsm_ids, states, symbols, rounds_u32, payoff, num_actions_u8,
+                    )
+                })
+                .collect();
+            used_gpu = false;
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = use_gpu;
+        all_results = all_dyn_payoffs
+            .iter()
+            .map(|payoff| {
+                run_fsm_tournament_cpu(
+                    &fsm_ids, states, symbols, rounds_u32, payoff, num_actions_u8,
+                )
+            })
+            .collect();
+        used_gpu = false;
+    }
+
+    // Build per-game winners
+    let mut game_results = Vec::with_capacity(game_strings.len());
+    for (idx, (a_scores, b_scores)) in all_results.into_iter().enumerate() {
+        let output = tournament::build_mixed_output(&specs, a_scores, b_scores, rounds_u32, &game_strings[idx]);
+        // Extract winner using ranking (top by total/mean/median)
+        let ranking = &output.ranking;
+        if ranking.len() < 2 {
+            game_results.push(serde_json::json!({"game": game_strings[idx]}));
+            continue;
+        }
+        let top_total = &ranking.iter().max_by(|a, b| a.total.cmp(&b.total)).unwrap();
+        let second_total = &ranking.iter().filter(|r| r.label != top_total.label)
+            .max_by(|a, b| a.total.cmp(&b.total)).unwrap();
+        let top_mean = &ranking.iter().max_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap()).unwrap();
+        let second_mean = &ranking.iter().filter(|r| r.label != top_mean.label)
+            .max_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap()).unwrap();
+        let top_median = &ranking.iter().max_by(|a, b| a.median.partial_cmp(&b.median).unwrap()).unwrap();
+        let second_median = &ranking.iter().filter(|r| r.label != top_median.label)
+            .max_by(|a, b| a.median.partial_cmp(&b.median).unwrap()).unwrap();
+
+        let has_tie = top_total.total == second_total.total
+            || (top_mean.mean - second_mean.mean).abs() < 1e-12
+            || (top_median.median - second_median.median).abs() < 1e-12;
+
+        if has_tie {
+            game_results.push(serde_json::json!({"game": game_strings[idx]}));
+        } else {
+            game_results.push(serde_json::json!({
+                "game": game_strings[idx],
+                "ByTotal": top_total.label,
+                "ByMean": top_mean.label,
+                "ByMedian": top_median.label,
+            }));
+        }
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    let output = serde_json::json!({
+        "results": game_results,
+        "num_games": game_strings.len(),
+        "num_strategies": fsm_ids.len(),
+        "time": elapsed,
+        "gpu": used_gpu,
+    });
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1848,7 +2008,7 @@ mod tests {
         let dyn_payoff = tournament::parse_game_dyn("pd").unwrap();
         let num_actions = dyn_payoff.num_actions as u8;
 
-        let (cpu_a_scores, _cpu_b_scores) = run_ca_tournament_cpu(&rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions);
+        let (cpu_a_scores, cpu_b_scores) = run_ca_tournament_cpu(&rule_ids, k, two_r, t, rounds, &dyn_payoff, num_actions);
 
         match gpu::run_ca_tournament_gpu(&rule_ids, k, two_r, t, rounds, dyn_payoff.num_actions as u32, &dyn_payoff.entries) {
             Ok(gpu_scores) => {
@@ -1881,7 +2041,7 @@ mod tests {
         let dyn_payoff = tournament::parse_game_dyn("pd").unwrap();
         let num_actions = dyn_payoff.num_actions as u8;
 
-        let (cpu_a_scores, _cpu_b_scores) = run_fsm_tournament_cpu(
+        let (cpu_a_scores, cpu_b_scores) = run_fsm_tournament_cpu(
             &fsm_ids, states, symbols, rounds, &dyn_payoff, num_actions,
         );
 
@@ -1896,27 +2056,188 @@ mod tests {
             &fsm_ids, states, symbols, rounds,
             dyn_payoff.num_actions as u32, &dyn_payoff.entries,
         ) {
-            Ok(gpu_scores) => {
-                eprintln!("  GPU scores (first row): {:?}", &gpu_scores[0]);
-                let gpu_nonzero = gpu_scores.iter()
+            Ok((gpu_a_scores, gpu_b_scores)) => {
+                eprintln!("  GPU a_scores (first row): {:?}", &gpu_a_scores[0]);
+                eprintln!("  GPU b_scores (first row): {:?}", &gpu_b_scores[0]);
+                let gpu_nonzero = gpu_a_scores.iter()
                     .flat_map(|row| row.iter())
                     .any(|&s| s != 0);
                 assert!(gpu_nonzero, "GPU FSM tournament should have non-zero scores");
 
-                assert_eq!(gpu_scores.len(), cpu_a_scores.len());
+                assert_eq!(gpu_a_scores.len(), cpu_a_scores.len());
                 for i in 0..fsm_ids.len() {
                     for j in 0..fsm_ids.len() {
                         assert_eq!(
-                            gpu_scores[i][j], cpu_a_scores[i][j],
-                            "Score mismatch at [{},{}]: GPU={} CPU={}",
-                            i, j, gpu_scores[i][j], cpu_a_scores[i][j]
+                            gpu_a_scores[i][j], cpu_a_scores[i][j],
+                            "a_score mismatch at [{},{}]: GPU={} CPU={}",
+                            i, j, gpu_a_scores[i][j], cpu_a_scores[i][j]
                         );
                     }
                 }
-                eprintln!("  FSM tournament GPU vs CPU: all scores match");
+
+                assert_eq!(gpu_b_scores.len(), cpu_b_scores.len());
+                for i in 0..fsm_ids.len() {
+                    for j in 0..fsm_ids.len() {
+                        assert_eq!(
+                            gpu_b_scores[i][j], cpu_b_scores[i][j],
+                            "b_score mismatch at [{},{}]: GPU={} CPU={}",
+                            i, j, gpu_b_scores[i][j], cpu_b_scores[i][j]
+                        );
+                    }
+                }
+                eprintln!("  FSM tournament GPU vs CPU: all a_scores and b_scores match");
             }
             Err(e) => {
                 eprintln!("  GPU not available, skipping FSM tournament comparison: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn fsm_multi_game_gpu_matches_single() {
+        // Verify that the batched multi-game GPU kernel produces the same
+        // results as running each game individually via the single-game path.
+        let fsm_ids: Vec<u64> = vec![0, 1, 18, 19, 22, 23];
+        let states = 2usize;
+        let symbols = 2usize;
+        let rounds = 50u32;
+
+        let pd = tournament::parse_game_dyn("pd").unwrap();
+        let chicken = tournament::parse_game_dyn("chicken").unwrap();
+        let custom = tournament::parse_game_dyn("1,0,0,1,-1,1,1,-1").unwrap();
+        let num_actions = pd.num_actions as u32;
+        let all_payoffs: Vec<Vec<[i32; 2]>> = vec![
+            pd.entries.clone(),
+            chicken.entries.clone(),
+            custom.entries.clone(),
+        ];
+
+        match gpu::run_fsm_multi_game_gpu(
+            &fsm_ids, states, symbols, rounds, num_actions, &all_payoffs,
+        ) {
+            Ok(multi_results) => {
+                assert_eq!(multi_results.len(), 3);
+                // Compare each game against the single-game GPU path
+                for (game_idx, payoff_entries) in all_payoffs.iter().enumerate() {
+                    let (single_a, single_b) = gpu::run_fsm_tournament_gpu(
+                        &fsm_ids, states, symbols, rounds, num_actions, payoff_entries,
+                    ).expect("single-game GPU failed");
+
+                    let (multi_a, multi_b) = &multi_results[game_idx];
+                    for i in 0..fsm_ids.len() {
+                        for j in 0..fsm_ids.len() {
+                            assert_eq!(
+                                multi_a[i][j], single_a[i][j],
+                                "game {} a_score[{},{}]: multi={} single={}",
+                                game_idx, i, j, multi_a[i][j], single_a[i][j]
+                            );
+                            assert_eq!(
+                                multi_b[i][j], single_b[i][j],
+                                "game {} b_score[{},{}]: multi={} single={}",
+                                game_idx, i, j, multi_b[i][j], single_b[i][j]
+                            );
+                        }
+                    }
+                }
+                eprintln!("  FSM multi-game GPU matches single-game GPU for all 3 games");
+            }
+            Err(e) => {
+                eprintln!("  GPU not available, skipping multi-game test: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn fsm_multi_game_gpu_stress_vs_cpu() {
+        // Stress test: FSM(3,2) with 20 different games, verify GPU multi-game
+        // matches CPU for every single score in the matrix.
+        let states = 3usize;
+        let symbols = 2usize;
+        let rounds = 30u32;
+        // Use a representative subset of FSM(3,2) IDs
+        let fsm_ids: Vec<u64> = vec![0, 1, 2, 10, 50, 100, 200, 500, 1000, 2000, 3000, 4000, 5000, 5831];
+        let n = fsm_ids.len();
+
+        // Generate 20 different games with varied payoffs
+        let game_strings = vec![
+            "pd", "chicken",
+            "-1,-1,-3,0,0,-3,-2,-2",    // standard PD
+            "3,3,0,5,5,0,1,1",          // stag hunt
+            "0,0,-1,1,1,-1,-5,-5",      // chicken variant
+            "2,2,-1,3,3,-1,0,0",        // assurance game
+            "1,1,-2,2,2,-2,-1,-1",      // custom 1
+            "-2,-2,-4,1,1,-4,-3,-3",    // custom 2
+            "5,5,0,8,8,0,2,2",          // high stakes
+            "0,0,0,1,1,0,-1,-1",        // minimal
+            "-1,-1,0,0,0,0,-2,-2",      // near-zero
+            "10,10,-5,15,15,-5,1,1",    // large range
+            "1,0,0,1,-1,1,1,-1",        // zero-sum-ish
+            "3,3,1,4,4,1,2,2",          // all positive
+            "-3,-3,-5,-1,-1,-5,-4,-4",  // all negative
+            "0,0,-10,10,10,-10,-1,-1",  // extreme chicken
+            "1,1,-1,2,2,-1,0,0",        // mild PD
+            "4,4,0,6,6,0,3,3",          // cooperation dominant
+            "2,2,-3,4,4,-3,1,1",        // asymmetric-ish
+            "-1,-1,-2,0,0,-2,-3,-3",    // all bad
+        ];
+
+        let mut all_dyn_payoffs = Vec::new();
+        let mut all_payoff_entries = Vec::new();
+        for gs in &game_strings {
+            let dp = tournament::parse_game_dyn(gs).unwrap();
+            all_payoff_entries.push(dp.entries.clone());
+            all_dyn_payoffs.push(dp);
+        }
+        let num_actions = all_dyn_payoffs[0].num_actions;
+
+        // Run CPU for all games
+        let cpu_results: Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)> = all_dyn_payoffs
+            .iter()
+            .map(|payoff| {
+                run_fsm_tournament_cpu(
+                    &fsm_ids, states, symbols, rounds, payoff, num_actions as u8,
+                )
+            })
+            .collect();
+
+        // Run GPU multi-game
+        match gpu::run_fsm_multi_game_gpu(
+            &fsm_ids, states, symbols, rounds,
+            num_actions as u32, &all_payoff_entries,
+        ) {
+            Ok(gpu_results) => {
+                assert_eq!(gpu_results.len(), game_strings.len());
+                let mut total_checked = 0usize;
+                for (game_idx, ((gpu_a, gpu_b), (cpu_a, cpu_b))) in
+                    gpu_results.iter().zip(cpu_results.iter()).enumerate()
+                {
+                    assert_eq!(gpu_a.len(), n);
+                    assert_eq!(gpu_b.len(), n);
+                    for i in 0..n {
+                        for j in 0..n {
+                            assert_eq!(
+                                gpu_a[i][j], cpu_a[i][j],
+                                "game {} ({}) a_score[{},{}]: GPU={} CPU={}",
+                                game_idx, game_strings[game_idx],
+                                i, j, gpu_a[i][j], cpu_a[i][j]
+                            );
+                            assert_eq!(
+                                gpu_b[i][j], cpu_b[i][j],
+                                "game {} ({}) b_score[{},{}]: GPU={} CPU={}",
+                                game_idx, game_strings[game_idx],
+                                i, j, gpu_b[i][j], cpu_b[i][j]
+                            );
+                            total_checked += 2;
+                        }
+                    }
+                }
+                eprintln!(
+                    "  FSM(3,2) stress test: {} games × {}×{} matrix = {} scores all match (GPU multi-game vs CPU)",
+                    game_strings.len(), n, n, total_checked
+                );
+            }
+            Err(e) => {
+                eprintln!("  GPU not available, skipping stress test: {}", e);
             }
         }
     }

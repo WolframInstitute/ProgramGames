@@ -1579,6 +1579,74 @@ kernel void fsm_tournament(
 
     scores[gid] = int2(score_a, score_b);
 }}
+
+// ── Multi-game kernel: process many games in a single dispatch ──
+
+struct FsmMultiGameParams {{
+    uint num_pairs;
+    uint num_games;
+    uint states;
+    uint alphabet;
+    uint rounds;
+    uint num_actions;
+    uint payoff_stride; // num_actions * num_actions * 2
+    uint _pad;
+}};
+
+kernel void fsm_multi_game_tournament(
+    device const uint* starts        [[buffer(0)]],
+    device const uint* outputs       [[buffer(1)]],
+    device const uint* transitions   [[buffer(2)]],
+    device const uint2* pairs        [[buffer(3)]],
+    device int2* scores              [[buffer(4)]],
+    constant FsmMultiGameParams& params [[buffer(5)]],
+    device const int* all_payoffs    [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{{
+    uint total = params.num_pairs * params.num_games;
+    if (gid >= total) return;
+
+    uint game_idx = gid / params.num_pairs;
+    uint pair_idx = gid % params.num_pairs;
+
+    uint a_idx = pairs[pair_idx].x;
+    uint b_idx = pairs[pair_idx].y;
+    uint S = params.states;
+    uint K = params.alphabet;
+    uint na = params.num_actions;
+
+    device const int* payoff = all_payoffs + game_idx * params.payoff_stride;
+
+    uint a_state = starts[a_idx];
+    uint b_state = starts[b_idx];
+
+    int score_a = 0;
+    int score_b = 0;
+    uint prev_a_action = 0u;
+    uint prev_b_action = 0u;
+
+    for (uint round = 0u; round < params.rounds; round++) {{
+        uint a_action, b_action;
+        if (round == 0u) {{
+            a_action = outputs[a_idx * S + a_state] % na;
+            b_action = outputs[b_idx * S + b_state] % na;
+        }} else {{
+            a_state = transitions[a_idx * S * K + a_state * K + prev_b_action];
+            b_state = transitions[b_idx * S * K + b_state * K + prev_a_action];
+            a_action = outputs[a_idx * S + a_state] % na;
+            b_action = outputs[b_idx * S + b_state] % na;
+        }}
+
+        uint pidx = a_action * na + b_action;
+        score_a += payoff[pidx * 2];
+        score_b += payoff[pidx * 2 + 1];
+
+        prev_a_action = a_action;
+        prev_b_action = b_action;
+    }}
+
+    scores[game_idx * params.num_pairs + pair_idx] = int2(score_a, score_b);
+}}
 "#,
             max_states = max_states
         )
@@ -1588,6 +1656,7 @@ kernel void fsm_tournament(
         device: Device,
         queue: CommandQueue,
         pipeline: ComputePipelineState,
+        multi_game_pipeline: ComputePipelineState,
     }
 
     impl MetalFsmTournament {
@@ -1605,11 +1674,18 @@ kernel void fsm_tournament(
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| format!("Metal FSM tournament pipeline: {e}"))?;
+            let mg_func = library
+                .get_function("fsm_multi_game_tournament", None)
+                .map_err(|e| format!("Metal FSM multi-game function: {e}"))?;
+            let multi_game_pipeline = device
+                .new_compute_pipeline_state_with_function(&mg_func)
+                .map_err(|e| format!("Metal FSM multi-game pipeline: {e}"))?;
             let queue = device.new_command_queue();
             Ok(Self {
                 device,
                 queue,
                 pipeline,
+                multi_game_pipeline,
             })
         }
 
@@ -1621,10 +1697,10 @@ kernel void fsm_tournament(
             rounds: u32,
             num_actions: u32,
             payoff_entries: &[[i32; 2]],
-        ) -> Result<Vec<Vec<i64>>, String> {
+        ) -> Result<(Vec<Vec<i64>>, Vec<Vec<i64>>), String> {
             let n = fsm_ids.len();
             if n == 0 {
-                return Ok(vec![]);
+                return Ok((vec![], vec![]));
             }
 
             // Decode all FSMs
@@ -1644,6 +1720,26 @@ kernel void fsm_tournament(
                 }
             }
 
+            let (a_matrix, b_matrix) = self.run_tournament_with_buffers(
+                n, states, symbols, rounds, num_actions, payoff_entries,
+                &flat_starts, &flat_outputs, &flat_transitions,
+            )?;
+            Ok((a_matrix, b_matrix))
+        }
+
+        /// Run a tournament with pre-decoded FSM buffers. Allows reuse across games.
+        fn run_tournament_with_buffers(
+            &self,
+            n: usize,
+            states: usize,
+            symbols: usize,
+            rounds: u32,
+            num_actions: u32,
+            payoff_entries: &[[i32; 2]],
+            flat_starts: &[u32],
+            flat_outputs: &[u32],
+            flat_transitions: &[u32],
+        ) -> Result<(Vec<Vec<i64>>, Vec<Vec<i64>>), String> {
             // Build all ordered pairs (i, j) including self-play (matches WL Tuples[list, 2])
             let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(n * n);
             for i in 0..n {
@@ -1684,9 +1780,9 @@ kernel void fsm_tournament(
             };
 
             // Create buffers
-            let starts_buf = self.buf_from_slice(&flat_starts);
-            let outputs_buf = self.buf_from_slice(&flat_outputs);
-            let transitions_buf = self.buf_from_slice(&flat_transitions);
+            let starts_buf = self.buf_from_slice(flat_starts);
+            let outputs_buf = self.buf_from_slice(flat_outputs);
+            let transitions_buf = self.buf_from_slice(flat_transitions);
             let pairs_buf = self.buf_from_slice(&all_pairs);
             let scores_buf = self.device.new_buffer(
                 (num_pairs.max(1) * size_of::<[i32; 2]>()) as u64,
@@ -1727,19 +1823,183 @@ kernel void fsm_tournament(
             cmd_buf.commit();
             cmd_buf.wait_until_completed();
 
-            // Read results into score matrix
+            // Read results into score matrices (both a_scores and b_scores)
             let raw_scores = unsafe {
                 let ptr = scores_buf.contents() as *const [i32; 2];
                 std::slice::from_raw_parts(ptr, num_pairs)
             };
 
-            let mut matrix = vec![vec![0i64; n]; n];
+            let mut a_matrix = vec![vec![0i64; n]; n];
+            let mut b_matrix = vec![vec![0i64; n]; n];
             for (idx, score) in raw_scores.iter().enumerate() {
                 let pair = all_pairs[idx];
-                matrix[pair[0] as usize][pair[1] as usize] = score[0] as i64;
+                a_matrix[pair[0] as usize][pair[1] as usize] = score[0] as i64;
+                b_matrix[pair[0] as usize][pair[1] as usize] = score[1] as i64;
             }
 
-            Ok(matrix)
+            Ok((a_matrix, b_matrix))
+        }
+
+        /// Run tournaments for multiple games, reusing the GPU pipeline and decoded FSM data.
+        /// Uses a multi-game kernel to process many games per GPU dispatch.
+        /// Returns Vec of (a_scores, b_scores) per game.
+        pub fn run_multi_game_tournament(
+            &self,
+            fsm_ids: &[u64],
+            states: usize,
+            symbols: usize,
+            rounds: u32,
+            num_actions: u32,
+            all_payoffs: &[Vec<[i32; 2]>],
+        ) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>, String> {
+            let n = fsm_ids.len();
+            let num_games = all_payoffs.len();
+            if n == 0 {
+                return Ok(all_payoffs.iter().map(|_| (vec![], vec![])).collect());
+            }
+
+            // Decode all FSMs once
+            let mut flat_starts: Vec<u32> = Vec::with_capacity(n);
+            let mut flat_outputs: Vec<u32> = Vec::with_capacity(n * states);
+            let mut flat_transitions: Vec<u32> = Vec::with_capacity(n * states * symbols);
+
+            for &id in fsm_ids {
+                let (outputs, transitions) =
+                    super::super::strategy::decode_fsm(id, states, symbols);
+                flat_starts.push(0u32);
+                for &o in &outputs {
+                    flat_outputs.push(o as u32);
+                }
+                for &t in &transitions {
+                    flat_transitions.push(t as u32);
+                }
+            }
+
+            // Upload static buffers once (reused across all batches)
+            let starts_buf = self.buf_from_slice(&flat_starts);
+            let outputs_buf = self.buf_from_slice(&flat_outputs);
+            let transitions_buf = self.buf_from_slice(&flat_transitions);
+
+            // Build pairs once
+            let num_pairs = n * n;
+            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(num_pairs);
+            for i in 0..n {
+                for j in 0..n {
+                    all_pairs.push([i as u32, j as u32]);
+                }
+            }
+            let pairs_buf = self.buf_from_slice(&all_pairs);
+
+            // Payoff stride: interleaved [a,b] for each action pair
+            let payoff_stride = (num_actions as usize) * (num_actions as usize) * 2;
+
+            // Memory budget: ~1.5 GB for scores buffer
+            const MAX_SCORES_BYTES: usize = 1_500_000_000;
+            let score_bytes_per_game = num_pairs * size_of::<[i32; 2]>();
+            let games_per_batch = if score_bytes_per_game > 0 {
+                (MAX_SCORES_BYTES / score_bytes_per_game).max(1)
+            } else {
+                num_games
+            };
+
+            // Params struct matching the Metal FsmMultiGameParams
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct FsmMultiGameParams {
+                num_pairs: u32,
+                num_games: u32,
+                states: u32,
+                alphabet: u32,
+                rounds: u32,
+                num_actions: u32,
+                payoff_stride: u32,
+                _pad: u32,
+            }
+
+            let mut results: Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)> =
+                Vec::with_capacity(num_games);
+            // Pre-fill with empty matrices so we can index directly
+            for _ in 0..num_games {
+                results.push((vec![vec![0i64; n]; n], vec![vec![0i64; n]; n]));
+            }
+
+            for batch_start in (0..num_games).step_by(games_per_batch) {
+                let batch_end = (batch_start + games_per_batch).min(num_games);
+                let batch_count = batch_end - batch_start;
+
+                // Flatten payoffs for this batch
+                let mut flat_payoffs: Vec<i32> = Vec::with_capacity(batch_count * payoff_stride);
+                for game_idx in batch_start..batch_end {
+                    for entry in &all_payoffs[game_idx] {
+                        flat_payoffs.push(entry[0]);
+                        flat_payoffs.push(entry[1]);
+                    }
+                }
+
+                let params = FsmMultiGameParams {
+                    num_pairs: num_pairs as u32,
+                    num_games: batch_count as u32,
+                    states: states as u32,
+                    alphabet: symbols as u32,
+                    rounds,
+                    num_actions,
+                    payoff_stride: payoff_stride as u32,
+                    _pad: 0,
+                };
+
+                let total_threads = batch_count * num_pairs;
+                let payoffs_buf = self.buf_from_slice(&flat_payoffs);
+                let scores_buf = self.device.new_buffer(
+                    (total_threads.max(1) * size_of::<[i32; 2]>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+
+                let cmd_buf = self.queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.multi_game_pipeline);
+                encoder.set_buffer(0, Some(&starts_buf), 0);
+                encoder.set_buffer(1, Some(&outputs_buf), 0);
+                encoder.set_buffer(2, Some(&transitions_buf), 0);
+                encoder.set_buffer(3, Some(&pairs_buf), 0);
+                encoder.set_buffer(4, Some(&scores_buf), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<FsmMultiGameParams>() as u64,
+                    (&params as *const FsmMultiGameParams).cast(),
+                );
+                encoder.set_buffer(6, Some(&payoffs_buf), 0);
+
+                let width = self.multi_game_pipeline.thread_execution_width().max(1);
+                let threads_per_group = MTLSize::new(width, 1, 1);
+                let groups = MTLSize::new(
+                    (total_threads as u64 + width - 1) / width,
+                    1,
+                    1,
+                );
+                encoder.dispatch_thread_groups(groups, threads_per_group);
+                encoder.end_encoding();
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
+
+                // Read scores back and fill matrices
+                let raw_scores = unsafe {
+                    let ptr = scores_buf.contents() as *const [i32; 2];
+                    std::slice::from_raw_parts(ptr, total_threads)
+                };
+
+                for game_local in 0..batch_count {
+                    let game_global = batch_start + game_local;
+                    let offset = game_local * num_pairs;
+                    let (ref mut a_mat, ref mut b_mat) = results[game_global];
+                    for (pair_idx, pair) in all_pairs.iter().enumerate() {
+                        let score = raw_scores[offset + pair_idx];
+                        a_mat[pair[0] as usize][pair[1] as usize] = score[0] as i64;
+                        b_mat[pair[0] as usize][pair[1] as usize] = score[1] as i64;
+                    }
+                }
+            }
+
+            Ok(results)
         }
 
         fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
@@ -1913,7 +2173,7 @@ pub fn compute_ca_sig_len(depth: u32) -> u32 {
     len
 }
 
-/// Run an FSM tournament on GPU. Returns score_matrix[i][j].
+/// Run an FSM tournament on GPU. Returns (a_scores, b_scores) matrices.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub fn run_fsm_tournament_gpu(
     fsm_ids: &[u64],
@@ -1922,7 +2182,7 @@ pub fn run_fsm_tournament_gpu(
     rounds: u32,
     num_actions: u32,
     payoff_entries: &[[i32; 2]],
-) -> Result<Vec<Vec<i64>>, String> {
+) -> Result<(Vec<Vec<i64>>, Vec<Vec<i64>>), String> {
     let gpu = metal_impl::MetalFsmTournament::new(states)?;
     gpu.run_tournament(fsm_ids, states, symbols, rounds, num_actions, payoff_entries)
 }
@@ -1935,7 +2195,34 @@ pub fn run_fsm_tournament_gpu(
     _rounds: u32,
     _num_actions: u32,
     _payoff_entries: &[[i32; 2]],
-) -> Result<Vec<Vec<i64>>, String> {
+) -> Result<(Vec<Vec<i64>>, Vec<Vec<i64>>), String> {
+    Err("Metal not available".to_string())
+}
+
+/// Run FSM tournaments for multiple games on GPU, reusing pipeline and decoded FSMs.
+/// Returns Vec of (a_scores, b_scores) per game.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn run_fsm_multi_game_gpu(
+    fsm_ids: &[u64],
+    states: usize,
+    symbols: usize,
+    rounds: u32,
+    num_actions: u32,
+    all_payoffs: &[Vec<[i32; 2]>],
+) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>, String> {
+    let gpu = metal_impl::MetalFsmTournament::new(states)?;
+    gpu.run_multi_game_tournament(fsm_ids, states, symbols, rounds, num_actions, all_payoffs)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn run_fsm_multi_game_gpu(
+    _fsm_ids: &[u64],
+    _states: usize,
+    _symbols: usize,
+    _rounds: u32,
+    _num_actions: u32,
+    _all_payoffs: &[Vec<[i32; 2]>],
+) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>, String> {
     Err("Metal not available".to_string())
 }
 
