@@ -53,7 +53,11 @@ PacletObject[
           "WolframInstitute`ProgramGames`GameSpaceSurvey",
           "WolframInstitute`ProgramGames`GameRankingClasses",
           "WolframInstitute`ProgramGames`ComplexityMeasure",
-          "WolframInstitute`ProgramGames`ComplexityLandscapeSearch"
+          "WolframInstitute`ProgramGames`ComplexityLandscapeSearch",
+          "WolframInstitute`ProgramGames`ProgramIteratedGame",
+          "WolframInstitute`ProgramGames`IteratedGameFiniteStateMachine",
+          "WolframInstitute`ProgramGames`IteratedGameCellularAutomaton",
+          "WolframInstitute`ProgramGames`IteratedGameTuringMachine"
         }
       },
       {

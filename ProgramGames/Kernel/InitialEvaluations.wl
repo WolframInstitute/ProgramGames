@@ -37,6 +37,8 @@ PackageScope["FSMGameSurveyWL"]
 PackageScope["FSMMultiTournamentWL"]
 PackageScope["FSMComplexityWL"]
 PackageScope["RuleArrayTournamentWL"]
+PackageScope["IteratedGameWL"]
+PackageScope["IteratedGameTournamentWL"]
 
 
 (* ::Section::Closed:: *)
@@ -69,7 +71,9 @@ $ProgramGamesRequiredFunctionNames = {
 	"fsm_game_survey_wl",
 	"fsm_multi_tournament_wl",
 	"fsm_complexity_wl",
-	"rule_array_tournament_wl"
+	"rule_array_tournament_wl",
+	"iterated_game_wl",
+	"iterated_game_tournament_wl"
 };
 
 iMissingFunctionNames[funcs_Association] :=
@@ -117,6 +121,18 @@ ProgramGamesSetup[] := (
 
 
 ProgramGamesParallelLoad[] := (
+	CloseKernels[];
+	LaunchKernels[];
+	ParallelEvaluate[
+		Quiet[PacletDataRebuild[], PacletDataRebuild::lock];
+		<< WolframInstitute`TuringMachine`;
+		<< WolframInstitute`ProgramGames`
+	]
+)
+
+ProgramGamesParallelLoad[n_Integer] := (
+	CloseKernels[];
+	LaunchKernels[n];
 	ParallelEvaluate[
 		Quiet[PacletDataRebuild[], PacletDataRebuild::lock];
 		<< WolframInstitute`TuringMachine`;
@@ -224,3 +240,5 @@ FSMGameSurveyWL := functions["fsm_game_survey_wl"]
 FSMMultiTournamentWL := functions["fsm_multi_tournament_wl"]
 FSMComplexityWL := functions["fsm_complexity_wl"]
 RuleArrayTournamentWL := functions["rule_array_tournament_wl"]
+IteratedGameWL := functions["iterated_game_wl"]
+IteratedGameTournamentWL := functions["iterated_game_tournament_wl"]

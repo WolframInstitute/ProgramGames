@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::PathBuf;
 
-use crate::strategy::{play_game_dyn, StrategyRunner, StrategySpec};
+use crate::strategy::{play_game_dyn, play_game_with_history, StrategyRunner, StrategySpec};
 use crate::TmTransition;
 
 // ── History-to-integer conversion (matches WL HistoryToInput/FromDigits) ────
@@ -836,6 +836,130 @@ pub fn build_mixed_output(
         b_scores,
         pairwise,
         ranking,
+    }
+}
+
+// ── Iterated game (history-returning) ───────────────────────────────────────
+
+/// Output for a single iterated game between two strategies.
+#[derive(Serialize)]
+pub struct IteratedGameOutput {
+    pub label_a: String,
+    pub label_b: String,
+    pub history: Vec<[u8; 2]>,
+    pub rounds: u32,
+}
+
+/// Output for an iterated game tournament (all pairs, with histories).
+#[derive(Serialize)]
+pub struct IteratedGameTournamentOutput {
+    pub strategies: Vec<String>,
+    pub rounds: u32,
+    pub num_strategies: usize,
+    pub num_pairs: usize,
+    pub games: Vec<IteratedGamePairOutput>,
+}
+
+#[derive(Serialize)]
+pub struct IteratedGamePairOutput {
+    pub i: usize,
+    pub j: usize,
+    pub label_a: String,
+    pub label_b: String,
+    pub history: Vec<[u8; 2]>,
+}
+
+/// Run an iterated game tournament on CPU, returning full move histories for all pairs.
+/// Returns (survivor_indices, game_outputs).
+/// Non-halting strategies (TMs that don't halt) are excluded.
+pub fn run_iterated_game_tournament(
+    specs: &[StrategySpec],
+    rounds: u32,
+    initial_history: &[[u8; 2]],
+) -> (Vec<usize>, Vec<IteratedGamePairOutput>) {
+    let n = specs.len();
+    let pairs = all_pairs(n);
+
+    eprintln!(
+        "  CPU iterated game tournament: {} strategies, {} pairs, {} rounds (init_len={})",
+        n,
+        pairs.len(),
+        rounds,
+        initial_history.len()
+    );
+
+    use std::sync::Mutex;
+    let failed_set: Mutex<std::collections::HashSet<usize>> =
+        Mutex::new(std::collections::HashSet::new());
+
+    let results: Vec<((usize, usize), Vec<[u8; 2]>)> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            {
+                let fs = failed_set.lock().unwrap();
+                if fs.contains(&i) || fs.contains(&j) {
+                    return ((i, j), vec![]);
+                }
+            }
+            let mut runner_a = StrategyRunner::new(&specs[i]);
+            let mut runner_b = StrategyRunner::new(&specs[j]);
+            let (history, failed_flag) =
+                play_game_with_history(&mut runner_a, &mut runner_b, rounds, initial_history);
+            if failed_flag != 0 {
+                let mut fs = failed_set.lock().unwrap();
+                if failed_flag & 1 != 0 {
+                    fs.insert(i);
+                }
+                if failed_flag & 2 != 0 {
+                    fs.insert(j);
+                }
+            }
+            ((i, j), history)
+        })
+        .collect();
+
+    let failed = failed_set.into_inner().unwrap();
+    if !failed.is_empty() {
+        let failed_labels: Vec<String> = failed.iter().map(|&i| specs[i].label()).collect();
+        eprintln!(
+            "  Excluded {} non-halting strategies: {:?}",
+            failed.len(),
+            failed_labels
+        );
+    }
+
+    let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
+    let labels: Vec<String> = specs.iter().map(|s| s.label()).collect();
+
+    let games: Vec<IteratedGamePairOutput> = results
+        .into_iter()
+        .filter(|((i, j), _)| !failed.contains(i) && !failed.contains(j))
+        .map(|((i, j), history)| IteratedGamePairOutput {
+            i: survivors.iter().position(|&x| x == i).unwrap(),
+            j: survivors.iter().position(|&x| x == j).unwrap(),
+            label_a: labels[i].clone(),
+            label_b: labels[j].clone(),
+            history,
+        })
+        .collect();
+
+    (survivors, games)
+}
+
+/// Build output for an iterated game tournament.
+pub fn build_iterated_game_output(
+    specs: &[StrategySpec],
+    games: Vec<IteratedGamePairOutput>,
+    rounds: u32,
+) -> IteratedGameTournamentOutput {
+    let labels: Vec<String> = specs.iter().map(|s| s.label()).collect();
+    let n = specs.len();
+    IteratedGameTournamentOutput {
+        strategies: labels,
+        rounds,
+        num_strategies: n,
+        num_pairs: games.len(),
+        games,
     }
 }
 

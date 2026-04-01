@@ -1046,6 +1046,73 @@ pub fn play_game_dyn(
     (Some((score_a, score_b)), 0)
 }
 
+/// Play an iterated game between two strategy runners, returning the full move history.
+/// `initial_history` seeds the game: FSM states are advanced through it, and it is
+/// prepended to the returned history. `rounds` additional rounds are then played.
+/// Returns (history, failed_flag) where history is a Vec of [move_a, move_b] pairs.
+/// failed_flag: 0=none, 1=a failed, 2=b failed, 3=both failed.
+pub fn play_game_with_history(
+    runner_a: &mut StrategyRunner,
+    runner_b: &mut StrategyRunner,
+    rounds: u32,
+    initial_history: &[[u8; 2]],
+) -> (Vec<[u8; 2]>, u8) {
+    runner_a.reset();
+    runner_b.reset();
+
+    let init_len = initial_history.len() as u32;
+    let total = init_len + rounds;
+    let mut flat_history: Vec<u8> = Vec::with_capacity(2 * total as usize);
+    let mut move_history: Vec<[u8; 2]> = Vec::with_capacity(total as usize);
+    let mut prev_a: u8 = 0;
+    let mut prev_b: u8 = 0;
+
+    // Replay initial history: advance FSM states, populate flat history
+    for (round, &[ma, mb]) in initial_history.iter().enumerate() {
+        if runner_a.is_fsm() {
+            runner_a.get_fsm_move(prev_b, round as u32);
+        }
+        if runner_b.is_fsm() {
+            runner_b.get_fsm_move(prev_a, round as u32);
+        }
+        flat_history.push(ma);
+        flat_history.push(mb);
+        move_history.push([ma, mb]);
+        prev_a = ma;
+        prev_b = mb;
+    }
+
+    // Play new rounds
+    for round in init_len..total {
+        let move_a = if runner_a.is_fsm() {
+            runner_a.get_fsm_move(prev_b, round)
+        } else {
+            runner_a.get_move(&flat_history, round)
+        };
+        let move_a = match move_a {
+            Some(m) => m,
+            None => return (move_history, 1),
+        };
+        let move_b = if runner_b.is_fsm() {
+            runner_b.get_fsm_move(prev_a, round)
+        } else {
+            runner_b.get_move(&flat_history, round)
+        };
+        let move_b = match move_b {
+            Some(m) => m,
+            None => return (move_history, 2),
+        };
+
+        flat_history.push(move_a);
+        flat_history.push(move_b);
+        move_history.push([move_a, move_b]);
+        prev_a = move_a;
+        prev_b = move_b;
+    }
+
+    (move_history, 0)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

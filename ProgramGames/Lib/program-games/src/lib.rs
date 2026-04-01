@@ -841,6 +841,106 @@ pub fn program_tournament_wl(
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Play a single iterated game between exactly two strategies.
+/// `initial_history_json` is a JSON array of [moveA, moveB] pairs (e.g. "[[0,1],[1,0]]")
+/// that seed the game before `rounds` new rounds are played.
+/// Returns JSON with the full move history (initial + new).
+#[wll::export]
+pub fn iterated_game_wl(
+    rounds: i64,
+    strategies_ndjson: String,
+    initial_history_json: String,
+) -> String {
+    let rounds = rounds as u32;
+
+    let specs = match tournament::parse_strategies_inline(&strategies_ndjson) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if specs.len() != 2 {
+        return format!(
+            "{{\"error\":\"expected 2 strategies, got {}\"}}",
+            specs.len()
+        );
+    }
+
+    let initial_history: Vec<[u8; 2]> = if initial_history_json.trim().is_empty()
+        || initial_history_json.trim() == "[]"
+    {
+        vec![]
+    } else {
+        match serde_json::from_str(&initial_history_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return format!("{{\"error\":\"bad initial_history: {}\"}}", e)
+            }
+        }
+    };
+
+    let mut runner_a = strategy::StrategyRunner::new(&specs[0]);
+    let mut runner_b = strategy::StrategyRunner::new(&specs[1]);
+    let (history, failed) = strategy::play_game_with_history(
+        &mut runner_a,
+        &mut runner_b,
+        rounds,
+        &initial_history,
+    );
+
+    if failed != 0 {
+        return format!(
+            "{{\"error\":\"strategy failed to halt (flag={})\"}}",
+            failed
+        );
+    }
+
+    let output = tournament::IteratedGameOutput {
+        label_a: specs[0].label(),
+        label_b: specs[1].label(),
+        history,
+        rounds,
+    };
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Play iterated games between all pairs of strategies, returning full histories.
+/// strategies_ndjson is newline-delimited JSON specs.
+/// `initial_history_json` seeds every game (same seed for all pairs).
+#[wll::export]
+pub fn iterated_game_tournament_wl(
+    rounds: i64,
+    strategies_ndjson: String,
+    initial_history_json: String,
+) -> String {
+    let rounds = rounds as u32;
+
+    let specs = match tournament::parse_strategies_inline(&strategies_ndjson) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if specs.is_empty() {
+        return "{\"error\":\"no strategies provided\"}".to_string();
+    }
+
+    let initial_history: Vec<[u8; 2]> = if initial_history_json.trim().is_empty()
+        || initial_history_json.trim() == "[]"
+    {
+        vec![]
+    } else {
+        match serde_json::from_str(&initial_history_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return format!("{{\"error\":\"bad initial_history: {}\"}}", e)
+            }
+        }
+    };
+
+    let (survivors, games) =
+        tournament::run_iterated_game_tournament(&specs, rounds, &initial_history);
+    let surviving_specs: Vec<_> = survivors.iter().map(|&i| specs[i].clone()).collect();
+    let output = tournament::build_iterated_game_output(&surviving_specs, games, rounds);
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
 #[wll::export]
 pub fn tm_max_index_wl(states: i64, symbols: i64) -> i64 {
     let states = states as u16;
