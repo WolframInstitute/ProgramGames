@@ -11,7 +11,6 @@ PackageImport["GeneralUtilities`"]
 
 PackageExport["TuringMachineMaxIndex"]
 PackageExport["ProgramGamesSetup"]
-PackageExport["ProgramGamesParallelLoad"]
 
 
 (* ::Section::Closed:: *)
@@ -48,8 +47,6 @@ PackageScope["IteratedGameTournamentWL"]
 TuringMachineMaxIndex::usage = "TuringMachineMaxIndex[s, k] returns the maximum TM index for (s,k) space: (2sk)^(sk) - 1.";
 
 ProgramGamesSetup::usage = "ProgramGamesSetup[] installs required dependencies and builds the Rust library.";
-
-ProgramGamesParallelLoad::usage = "ProgramGamesParallelLoad[] restarts parallel kernels and loads ProgramGames on all of them.";
 
 
 (* ::Section::Closed:: *)
@@ -115,30 +112,6 @@ ProgramGamesSetup[] := (
 	]
 )
 
-
-(* ::Section::Closed:: *)
-(*Parallel Loading*)
-
-
-ProgramGamesParallelLoad[] := (
-	CloseKernels[];
-	LaunchKernels[];
-	ParallelEvaluate[
-		Quiet[PacletDataRebuild[], PacletDataRebuild::lock];
-		<< WolframInstitute`TuringMachine`;
-		<< WolframInstitute`ProgramGames`
-	]
-)
-
-ProgramGamesParallelLoad[n_Integer] := (
-	CloseKernels[];
-	LaunchKernels[n];
-	ParallelEvaluate[
-		Quiet[PacletDataRebuild[], PacletDataRebuild::lock];
-		<< WolframInstitute`TuringMachine`;
-		<< WolframInstitute`ProgramGames`
-	]
-)
 
 
 (* ::Section::Closed:: *)
