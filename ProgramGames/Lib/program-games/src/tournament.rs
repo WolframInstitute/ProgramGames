@@ -963,6 +963,127 @@ pub fn build_iterated_game_output(
     }
 }
 
+// ── Cross-product iterated game (left × right, history-returning) ───────────
+
+/// Output for a cross-product iterated game batch.
+#[derive(Serialize)]
+pub struct IteratedGameCrossOutput {
+    pub left_strategies: Vec<String>,
+    pub right_strategies: Vec<String>,
+    pub rounds: u32,
+    pub num_left: usize,
+    pub num_right: usize,
+    pub num_pairs: usize,
+    pub games: Vec<IteratedGamePairOutput>,
+}
+
+/// Run iterated games for the cross-product of two strategy sets (left × right).
+/// Returns (left_survivors, right_survivors, game_outputs).
+/// Non-halting strategies are excluded from both sets.
+pub fn run_iterated_game_cross(
+    left_specs: &[StrategySpec],
+    right_specs: &[StrategySpec],
+    rounds: u32,
+    initial_history: &[[u8; 2]],
+) -> (Vec<usize>, Vec<usize>, Vec<IteratedGamePairOutput>) {
+    let nl = left_specs.len();
+    let nr = right_specs.len();
+
+    // Build cross-product pairs
+    let pairs: Vec<(usize, usize)> = (0..nl)
+        .flat_map(|i| (0..nr).map(move |j| (i, j)))
+        .collect();
+
+    eprintln!(
+        "  CPU cross-product game: {} left x {} right = {} pairs, {} rounds (init_len={})",
+        nl,
+        nr,
+        pairs.len(),
+        rounds,
+        initial_history.len()
+    );
+
+    use std::sync::Mutex;
+    let left_failed: Mutex<std::collections::HashSet<usize>> =
+        Mutex::new(std::collections::HashSet::new());
+    let right_failed: Mutex<std::collections::HashSet<usize>> =
+        Mutex::new(std::collections::HashSet::new());
+
+    let results: Vec<((usize, usize), Vec<[u8; 2]>)> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            {
+                let lf = left_failed.lock().unwrap();
+                let rf = right_failed.lock().unwrap();
+                if lf.contains(&i) || rf.contains(&j) {
+                    return ((i, j), vec![]);
+                }
+            }
+            let mut runner_a = StrategyRunner::new(&left_specs[i]);
+            let mut runner_b = StrategyRunner::new(&right_specs[j]);
+            let (history, failed_flag) =
+                play_game_with_history(&mut runner_a, &mut runner_b, rounds, initial_history);
+            if failed_flag != 0 {
+                if failed_flag & 1 != 0 {
+                    left_failed.lock().unwrap().insert(i);
+                }
+                if failed_flag & 2 != 0 {
+                    right_failed.lock().unwrap().insert(j);
+                }
+            }
+            ((i, j), history)
+        })
+        .collect();
+
+    let lf = left_failed.into_inner().unwrap();
+    let rf = right_failed.into_inner().unwrap();
+    if !lf.is_empty() || !rf.is_empty() {
+        eprintln!(
+            "  Excluded {} left + {} right non-halting strategies",
+            lf.len(),
+            rf.len()
+        );
+    }
+
+    let left_survivors: Vec<usize> = (0..nl).filter(|i| !lf.contains(i)).collect();
+    let right_survivors: Vec<usize> = (0..nr).filter(|j| !rf.contains(j)).collect();
+
+    let left_labels: Vec<String> = left_specs.iter().map(|s| s.label()).collect();
+    let right_labels: Vec<String> = right_specs.iter().map(|s| s.label()).collect();
+
+    let games: Vec<IteratedGamePairOutput> = results
+        .into_iter()
+        .filter(|((i, j), _)| !lf.contains(i) && !rf.contains(j))
+        .map(|((i, j), history)| IteratedGamePairOutput {
+            i: left_survivors.iter().position(|&x| x == i).unwrap(),
+            j: right_survivors.iter().position(|&x| x == j).unwrap(),
+            label_a: left_labels[i].clone(),
+            label_b: right_labels[j].clone(),
+            history,
+        })
+        .collect();
+
+    (left_survivors, right_survivors, games)
+}
+
+/// Build output for a cross-product iterated game batch.
+pub fn build_iterated_game_cross_output(
+    left_specs: &[StrategySpec],
+    right_specs: &[StrategySpec],
+    games: Vec<IteratedGamePairOutput>,
+    rounds: u32,
+) -> IteratedGameCrossOutput {
+    IteratedGameCrossOutput {
+        left_strategies: left_specs.iter().map(|s| s.label()).collect(),
+        right_strategies: right_specs.iter().map(|s| s.label()).collect(),
+        rounds,
+        num_left: left_specs.len(),
+        num_right: right_specs.len(),
+        num_pairs: games.len(),
+        games,
+    }
+}
+
 /// Write mixed tournament output as pretty JSON to stdout.
 pub fn write_mixed_output(output: &MixedTournamentOutput) {
     let stdout = io::stdout();

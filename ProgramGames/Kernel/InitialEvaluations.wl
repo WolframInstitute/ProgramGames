@@ -38,6 +38,7 @@ PackageScope["FSMComplexityWL"]
 PackageScope["RuleArrayTournamentWL"]
 PackageScope["IteratedGameWL"]
 PackageScope["IteratedGameTournamentWL"]
+PackageScope["IteratedGameCrossWL"]
 
 
 (* ::Section::Closed:: *)
@@ -70,7 +71,8 @@ $ProgramGamesRequiredFunctionNames = {
 	"fsm_complexity_wl",
 	"rule_array_tournament_wl",
 	"iterated_game_wl",
-	"iterated_game_tournament_wl"
+	"iterated_game_tournament_wl",
+	"iterated_game_cross_wl"
 };
 
 iMissingFunctionNames[funcs_Association] :=
@@ -215,3 +217,4 @@ FSMComplexityWL := functions["fsm_complexity_wl"]
 RuleArrayTournamentWL := functions["rule_array_tournament_wl"]
 IteratedGameWL := functions["iterated_game_wl"]
 IteratedGameTournamentWL := functions["iterated_game_tournament_wl"]
+IteratedGameCrossWL := functions["iterated_game_cross_wl"]

@@ -8,6 +8,7 @@ Package["WolframInstitute`ProgramGames`"]
 
 
 PackageExport["ProgramIteratedGame"]
+PackageExport["ProgramIteratedGameCross"]
 PackageExport["IteratedGameFiniteStateMachine"]
 PackageExport["IteratedGameCellularAutomaton"]
 PackageExport["IteratedGameTuringMachine"]
@@ -31,7 +32,12 @@ between all pairs of CA strategies and returns an Association of pairwise move h
 IteratedGameTuringMachine::usage = "IteratedGameTuringMachine[ids, s, k] plays iterated games \
 between all pairs of TM strategies and returns an Association of pairwise move histories.";
 
+ProgramIteratedGameCross::usage = "ProgramIteratedGameCross[leftStrategies, rightStrategies] plays \
+iterated games between every left strategy and every right strategy in a single batched call, \
+returning an Association with full move histories for all L\[Times]R pairs.";
+
 ProgramIteratedGame::err = "Game failed: ``";
+ProgramIteratedGameCross::err = "Game failed: ``";
 IteratedGameFiniteStateMachine::err = "Game failed: ``";
 IteratedGameCellularAutomaton::err = "Game failed: ``";
 IteratedGameTuringMachine::err = "Game failed: ``";
@@ -57,6 +63,27 @@ ProgramIteratedGame[{s1_List, s2_List}, opts : OptionsPattern[]] :=
 
 
 (* ::Section::Closed:: *)
+(*ProgramIteratedGameCross*)
+
+
+Options[ProgramIteratedGameCross] = {"Rounds" -> 100, "InitialHistory" -> {}};
+
+ProgramIteratedGameCross[leftSpecs_List, rightSpecs_List, opts : OptionsPattern[]] :=
+	Module[{leftNdjson, rightNdjson, initJSON, resultJSON, result},
+		leftNdjson = StringRiffle[StrategyToJSON /@ leftSpecs, "\n"];
+		rightNdjson = StringRiffle[StrategyToJSON /@ rightSpecs, "\n"];
+		initJSON = ExportString[OptionValue["InitialHistory"], "RawJSON", "Compact" -> True];
+		resultJSON = IteratedGameCrossWL[
+			OptionValue["Rounds"], leftNdjson, rightNdjson, initJSON];
+		If[FailureQ[resultJSON], Return[$Failed]];
+		result = ImportString[resultJSON, "RawJSON"];
+		If[KeyExistsQ[result, "error"],
+			Message[ProgramIteratedGameCross::err, result["error"]]; Return[$Failed]];
+		iParseIteratedGameCrossResult[result]
+	]
+
+
+(* ::Section::Closed:: *)
 (*Helper: Parse Tournament Result*)
 
 
@@ -71,6 +98,24 @@ iParseIteratedGameResult[result_] :=
 			"Games" -> games,
 			"Rounds" -> result["rounds"],
 			"NumStrategies" -> result["num_strategies"],
+			"NumPairs" -> result["num_pairs"]
+		|>
+	]
+
+iParseIteratedGameCrossResult[result_] :=
+	Module[{leftStrategies, rightStrategies, games},
+		leftStrategies = result["left_strategies"];
+		rightStrategies = result["right_strategies"];
+		games = Association[
+			{iParseLabel[#["label_a"]], iParseLabel[#["label_b"]]} -> #["history"] & /@ result["games"]
+		];
+		<|
+			"LeftStrategies" -> (iParseLabel /@ leftStrategies),
+			"RightStrategies" -> (iParseLabel /@ rightStrategies),
+			"Games" -> games,
+			"Rounds" -> result["rounds"],
+			"NumLeft" -> result["num_left"],
+			"NumRight" -> result["num_right"],
 			"NumPairs" -> result["num_pairs"]
 		|>
 	]

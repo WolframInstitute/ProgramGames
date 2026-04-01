@@ -55,6 +55,7 @@ PacletObject[
           "WolframInstitute`ProgramGames`ComplexityMeasure",
           "WolframInstitute`ProgramGames`ComplexityLandscapeSearch",
           "WolframInstitute`ProgramGames`ProgramIteratedGame",
+          "WolframInstitute`ProgramGames`ProgramIteratedGameCross",
           "WolframInstitute`ProgramGames`IteratedGameFiniteStateMachine",
           "WolframInstitute`ProgramGames`IteratedGameCellularAutomaton",
           "WolframInstitute`ProgramGames`IteratedGameTuringMachine"

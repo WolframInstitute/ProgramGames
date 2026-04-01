@@ -941,6 +941,59 @@ pub fn iterated_game_tournament_wl(
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Play iterated games for the cross-product of two strategy sets (left × right).
+/// Returns JSON with full move histories for all L×R pairs in a single batch.
+#[wll::export]
+pub fn iterated_game_cross_wl(
+    rounds: i64,
+    left_strategies_ndjson: String,
+    right_strategies_ndjson: String,
+    initial_history_json: String,
+) -> String {
+    let rounds = rounds as u32;
+
+    let left_specs = match tournament::parse_strategies_inline(&left_strategies_ndjson) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    let right_specs = match tournament::parse_strategies_inline(&right_strategies_ndjson) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if left_specs.is_empty() || right_specs.is_empty() {
+        return "{\"error\":\"both strategy sets must be non-empty\"}".to_string();
+    }
+
+    let initial_history: Vec<[u8; 2]> = if initial_history_json.trim().is_empty()
+        || initial_history_json.trim() == "[]"
+    {
+        vec![]
+    } else {
+        match serde_json::from_str(&initial_history_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return format!("{{\"error\":\"bad initial_history: {}\"}}", e)
+            }
+        }
+    };
+
+    let (left_surv, right_surv, games) = tournament::run_iterated_game_cross(
+        &left_specs,
+        &right_specs,
+        rounds,
+        &initial_history,
+    );
+    let surviving_left: Vec<_> = left_surv.iter().map(|&i| left_specs[i].clone()).collect();
+    let surviving_right: Vec<_> = right_surv.iter().map(|&i| right_specs[i].clone()).collect();
+    let output = tournament::build_iterated_game_cross_output(
+        &surviving_left,
+        &surviving_right,
+        games,
+        rounds,
+    );
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
 #[wll::export]
 pub fn tm_max_index_wl(states: i64, symbols: i64) -> i64 {
     let states = states as u16;
