@@ -50,7 +50,10 @@ PacletObject[
           "WolframInstitute`ProgramGames`StrategyToJSON",
           "WolframInstitute`ProgramGames`EnumerateGames",
           "WolframInstitute`ProgramGames`GameWinner",
-          "WolframInstitute`ProgramGames`GameSpaceSurvey"
+          "WolframInstitute`ProgramGames`GameSpaceSurvey",
+          "WolframInstitute`ProgramGames`GameRankingClasses",
+          "WolframInstitute`ProgramGames`ComplexityMeasure",
+          "WolframInstitute`ProgramGames`ComplexityLandscapeSearch"
         }
       },
       {

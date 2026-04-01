@@ -1377,6 +1377,99 @@ fn run_fsm_tournament_cpu(
     (a_matrix, b_matrix)
 }
 
+/// CPU fallback for FSM complexity computation using Rayon.
+/// Returns (lz_matrix, hash_matrix).
+fn run_fsm_complexity_cpu(
+    fsm_ids: &[u64],
+    states: usize,
+    symbols: usize,
+    rounds: u32,
+    num_actions: u8,
+) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+    let n = fsm_ids.len();
+    let specs: Vec<strategy::StrategySpec> = fsm_ids
+        .iter()
+        .map(|&id| strategy::StrategySpec::Fsm {
+            id,
+            s: states as u16,
+            k: symbols as u8,
+            num_actions,
+        })
+        .collect();
+
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (0..n).map(move |j| (i, j)))
+        .collect();
+
+    let pair_results: Vec<(usize, usize, u32, u32)> = pairs
+        .into_par_iter()
+        .map(|(i, j)| {
+            let mut runner_a = strategy::StrategyRunner::new(&specs[i]);
+            let mut runner_b = strategy::StrategyRunner::new(&specs[j]);
+            runner_a.reset();
+            runner_b.reset();
+
+            // Simulate and record player A's actions
+            let mut seq: Vec<u8> = Vec::with_capacity(rounds as usize);
+            let mut prev_a: u8 = 0;
+            let mut prev_b: u8 = 0;
+
+            for round in 0..rounds {
+                let move_a = runner_a.get_fsm_move(prev_b, round).unwrap_or(0);
+                let move_b = runner_b.get_fsm_move(prev_a, round).unwrap_or(0);
+                seq.push(move_a);
+                prev_a = move_a;
+                prev_b = move_b;
+            }
+
+            // LZ76 complexity
+            let lz = lz76_complexity(&seq);
+
+            // FNV-1a hash
+            let mut hash: u32 = 2166136261;
+            for &s in &seq {
+                hash ^= s as u32;
+                hash = hash.wrapping_mul(16777619);
+            }
+
+            (i, j, lz, hash)
+        })
+        .collect();
+
+    let mut lz_matrix = vec![vec![0u32; n]; n];
+    let mut hash_matrix = vec![vec![0u32; n]; n];
+    for (i, j, lz, hash) in pair_results {
+        lz_matrix[i][j] = lz;
+        hash_matrix[i][j] = hash;
+    }
+    (lz_matrix, hash_matrix)
+}
+
+/// LZ76 factorization complexity of a byte sequence.
+fn lz76_complexity(seq: &[u8]) -> u32 {
+    let n = seq.len();
+    let mut c: u32 = 0;
+    let mut pos: usize = 0;
+    while pos < n {
+        let mut longest: usize = 0;
+        for ref_pos in 0..pos {
+            let mut match_len: usize = 0;
+            while pos + match_len < n
+                && ref_pos + match_len < pos
+                && seq[ref_pos + match_len] == seq[pos + match_len]
+            {
+                match_len += 1;
+            }
+            if match_len > longest {
+                longest = match_len;
+            }
+        }
+        c += 1;
+        pos += longest + 1;
+    }
+    c
+}
+
 /// Batched FSM game survey: runs tournaments for ALL games in a single call,
 /// reusing the GPU pipeline and decoded FSM data. Much faster than calling
 /// fsm_tournament_wl once per game.
@@ -1537,6 +1630,102 @@ pub fn fsm_game_survey_wl(
         "num_strategies": fsm_ids.len(),
         "time": elapsed,
         "gpu": used_gpu,
+    });
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Compute LZ76 complexity and count-distinct for all FSM pairs.
+/// Returns JSON: {"lz": [mean_lz per FSM], "count_distinct": [cd per FSM],
+///                "ids": [...], "gpu": bool}
+#[wll::export]
+pub fn fsm_complexity_wl(
+    states: i64,
+    symbols: i64,
+    rounds: i64,
+    fsm_ids_json: String,
+    use_gpu: bool,
+) -> String {
+    let states = states as usize;
+    let symbols = symbols as usize;
+    let rounds = rounds as u32;
+    let num_actions = symbols as u32; // for 2-color FSMs, 2 actions
+
+    let fsm_ids: Vec<u64> = match serde_json::from_str(&fsm_ids_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+    if fsm_ids.is_empty() {
+        return "{\"error\":\"no FSM IDs provided\"}".to_string();
+    }
+
+    let n = fsm_ids.len();
+    let lz_matrix: Vec<Vec<u32>>;
+    let hash_matrix: Vec<Vec<u32>>;
+    let used_gpu: bool;
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if use_gpu {
+            match gpu::run_fsm_complexity_gpu(
+                &fsm_ids, states, symbols, rounds, num_actions,
+            ) {
+                Ok((lz, hsh)) => {
+                    lz_matrix = lz;
+                    hash_matrix = hsh;
+                    used_gpu = true;
+                }
+                Err(_e) => {
+                    let (lz, hsh) = run_fsm_complexity_cpu(
+                        &fsm_ids, states, symbols, rounds, symbols as u8,
+                    );
+                    lz_matrix = lz;
+                    hash_matrix = hsh;
+                    used_gpu = false;
+                }
+            };
+        } else {
+            let (lz, hsh) = run_fsm_complexity_cpu(
+                &fsm_ids, states, symbols, rounds, symbols as u8,
+            );
+            lz_matrix = lz;
+            hash_matrix = hsh;
+            used_gpu = false;
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = use_gpu;
+        let (lz, hsh) = run_fsm_complexity_cpu(
+            &fsm_ids, states, symbols, rounds, symbols as u8,
+        );
+        lz_matrix = lz;
+        hash_matrix = hsh;
+        used_gpu = false;
+    }
+
+    // Aggregate: mean LZ and count-distinct per FSM
+    let mean_lz: Vec<f64> = (0..n)
+        .map(|i| {
+            let sum: u64 = (0..n).map(|j| lz_matrix[i][j] as u64).sum();
+            sum as f64 / n as f64
+        })
+        .collect();
+
+    let count_distinct: Vec<usize> = (0..n)
+        .map(|i| {
+            let mut seen = std::collections::HashSet::new();
+            for j in 0..n {
+                seen.insert(hash_matrix[i][j]);
+            }
+            seen.len()
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "lz": mean_lz,
+        "count_distinct": count_distinct,
+        "ids": fsm_ids,
+        "gpu": used_gpu
     });
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }

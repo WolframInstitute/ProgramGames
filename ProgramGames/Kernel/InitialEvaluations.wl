@@ -34,6 +34,7 @@ PackageScope["CATournamentWL"]
 PackageScope["FSMClassifyWL"]
 PackageScope["FSMTournamentWL"]
 PackageScope["FSMGameSurveyWL"]
+PackageScope["FSMComplexityWL"]
 PackageScope["RuleArrayTournamentWL"]
 
 
@@ -65,6 +66,7 @@ $ProgramGamesRequiredFunctionNames = {
 	"fsm_classify_wl",
 	"fsm_tournament_wl",
 	"fsm_game_survey_wl",
+	"fsm_complexity_wl",
 	"rule_array_tournament_wl"
 };
 
@@ -217,4 +219,5 @@ CATournamentWL := functions["ca_tournament_wl"]
 FSMClassifyWL := functions["fsm_classify_wl"]
 FSMTournamentWL := functions["fsm_tournament_wl"]
 FSMGameSurveyWL := functions["fsm_game_survey_wl"]
+FSMComplexityWL := functions["fsm_complexity_wl"]
 RuleArrayTournamentWL := functions["rule_array_tournament_wl"]

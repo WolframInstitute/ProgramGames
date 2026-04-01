@@ -1647,6 +1647,81 @@ kernel void fsm_multi_game_tournament(
 
     scores[game_idx * params.num_pairs + pair_idx] = int2(score_a, score_b);
 }}
+
+// ── LZ76 Complexity + Hash kernel ──
+// Simulates each FSM pair, records player A's actions, computes:
+//   - LZ76 factorization complexity
+//   - FNV-1a hash for count-distinct on CPU
+// Output: uint2(lz_complexity, action_hash) per pair
+
+kernel void fsm_lz_complexity(
+    device const uint* starts        [[buffer(0)]],
+    device const uint* outputs       [[buffer(1)]],
+    device const uint* transitions   [[buffer(2)]],
+    device const uint2* pairs        [[buffer(3)]],
+    device uint2* results            [[buffer(4)]],
+    constant FsmGameParams& params   [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{{
+    if (gid >= params.num_pairs) return;
+
+    uint a_idx = pairs[gid].x;
+    uint b_idx = pairs[gid].y;
+    uint S = params.states;
+    uint K = params.alphabet;
+    uint na = params.num_actions;
+
+    uint a_state = starts[a_idx];
+    uint b_state = starts[b_idx];
+
+    uint seq[256];
+    uint prev_a = 0u;
+    uint prev_b = 0u;
+
+    for (uint round = 0u; round < params.rounds; round++) {{
+        uint a_action, b_action;
+        if (round == 0u) {{
+            a_action = outputs[a_idx * S + a_state] % na;
+            b_action = outputs[b_idx * S + b_state] % na;
+        }} else {{
+            a_state = transitions[a_idx * S * K + a_state * K + prev_b];
+            b_state = transitions[b_idx * S * K + b_state * K + prev_a];
+            a_action = outputs[a_idx * S + a_state] % na;
+            b_action = outputs[b_idx * S + b_state] % na;
+        }}
+        seq[round] = a_action;
+        prev_a = a_action;
+        prev_b = b_action;
+    }}
+
+    uint n = params.rounds;
+
+    // LZ76 factorization complexity
+    uint lz_count = 0;
+    uint pos = 0;
+    while (pos < n) {{
+        uint longest = 0;
+        for (uint ref_pos = 0; ref_pos < pos; ref_pos++) {{
+            uint match_len = 0;
+            while (pos + match_len < n && ref_pos + match_len < pos &&
+                   seq[ref_pos + match_len] == seq[pos + match_len]) {{
+                match_len++;
+            }}
+            if (match_len > longest) longest = match_len;
+        }}
+        lz_count++;
+        pos += longest + 1;
+    }}
+
+    // FNV-1a hash for count-distinct
+    uint hash_val = 2166136261u;
+    for (uint hi = 0u; hi < n; hi++) {{
+        hash_val ^= seq[hi];
+        hash_val *= 16777619u;
+    }}
+
+    results[gid] = uint2(lz_count, hash_val);
+}}
 "#,
             max_states = max_states
         )
@@ -1657,6 +1732,7 @@ kernel void fsm_multi_game_tournament(
         queue: CommandQueue,
         pipeline: ComputePipelineState,
         multi_game_pipeline: ComputePipelineState,
+        lz_pipeline: ComputePipelineState,
     }
 
     impl MetalFsmTournament {
@@ -1680,12 +1756,19 @@ kernel void fsm_multi_game_tournament(
             let multi_game_pipeline = device
                 .new_compute_pipeline_state_with_function(&mg_func)
                 .map_err(|e| format!("Metal FSM multi-game pipeline: {e}"))?;
+            let lz_func = library
+                .get_function("fsm_lz_complexity", None)
+                .map_err(|e| format!("Metal FSM LZ complexity function: {e}"))?;
+            let lz_pipeline = device
+                .new_compute_pipeline_state_with_function(&lz_func)
+                .map_err(|e| format!("Metal FSM LZ complexity pipeline: {e}"))?;
             let queue = device.new_command_queue();
             Ok(Self {
                 device,
                 queue,
                 pipeline,
                 multi_game_pipeline,
+                lz_pipeline,
             })
         }
 
@@ -2002,6 +2085,131 @@ kernel void fsm_multi_game_tournament(
             Ok(results)
         }
 
+        /// Run LZ76 complexity computation on GPU.
+        /// Returns (lz_values, hashes) where:
+        /// - lz_values[i][j] = LZ76 complexity of FSM i's action sequence vs FSM j
+        /// - hashes[i][j] = FNV-1a hash of FSM i's action sequence vs FSM j
+        pub fn run_complexity(
+            &self,
+            fsm_ids: &[u64],
+            states: usize,
+            symbols: usize,
+            rounds: u32,
+            num_actions: u32,
+        ) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
+            let n = fsm_ids.len();
+            if n == 0 {
+                return Ok((vec![], vec![]));
+            }
+
+            // Decode all FSMs
+            let mut flat_starts: Vec<u32> = Vec::with_capacity(n);
+            let mut flat_outputs: Vec<u32> = Vec::with_capacity(n * states);
+            let mut flat_transitions: Vec<u32> = Vec::with_capacity(n * states * symbols);
+
+            for &id in fsm_ids {
+                let (outputs, transitions) =
+                    super::super::strategy::decode_fsm(id, states, symbols);
+                flat_starts.push(0u32);
+                for &o in &outputs {
+                    flat_outputs.push(o as u32);
+                }
+                for &t in &transitions {
+                    flat_transitions.push(t as u32);
+                }
+            }
+
+            // Build all ordered pairs
+            let num_pairs = n * n;
+            let mut all_pairs: Vec<[u32; 2]> = Vec::with_capacity(num_pairs);
+            for i in 0..n {
+                for j in 0..n {
+                    all_pairs.push([i as u32, j as u32]);
+                }
+            }
+
+            // Params (reuse FsmGameParams, payoff unused but struct must match)
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct FsmGameParams {
+                num_pairs: u32,
+                states: u32,
+                alphabet: u32,
+                rounds: u32,
+                num_actions: u32,
+                _pad: u32,
+                payoff: [i32; 8],
+            }
+
+            let params = FsmGameParams {
+                num_pairs: num_pairs as u32,
+                states: states as u32,
+                alphabet: symbols as u32,
+                rounds,
+                num_actions,
+                _pad: 0,
+                payoff: [0i32; 8],
+            };
+
+            let starts_buf = self.buf_from_slice(&flat_starts);
+            let outputs_buf = self.buf_from_slice(&flat_outputs);
+            let transitions_buf = self.buf_from_slice(&flat_transitions);
+            let pairs_buf = self.buf_from_slice(&all_pairs);
+            let results_buf = self.device.new_buffer(
+                (num_pairs.max(1) * std::mem::size_of::<[u32; 2]>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::write_bytes(
+                    results_buf.contents() as *mut u8,
+                    0,
+                    num_pairs * std::mem::size_of::<[u32; 2]>(),
+                );
+            }
+
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.lz_pipeline);
+            encoder.set_buffer(0, Some(&starts_buf), 0);
+            encoder.set_buffer(1, Some(&outputs_buf), 0);
+            encoder.set_buffer(2, Some(&transitions_buf), 0);
+            encoder.set_buffer(3, Some(&pairs_buf), 0);
+            encoder.set_buffer(4, Some(&results_buf), 0);
+            encoder.set_bytes(
+                5,
+                std::mem::size_of::<FsmGameParams>() as u64,
+                (&params as *const FsmGameParams).cast(),
+            );
+
+            let width = self.lz_pipeline.thread_execution_width().max(1);
+            let threads_per_group = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (num_pairs as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            encoder.dispatch_thread_groups(groups, threads_per_group);
+            encoder.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+
+            // Read results
+            let raw_results = unsafe {
+                let ptr = results_buf.contents() as *const [u32; 2];
+                std::slice::from_raw_parts(ptr, num_pairs)
+            };
+
+            let mut lz_matrix = vec![vec![0u32; n]; n];
+            let mut hash_matrix = vec![vec![0u32; n]; n];
+            for (idx, &result) in raw_results.iter().enumerate() {
+                let pair = all_pairs[idx];
+                lz_matrix[pair[0] as usize][pair[1] as usize] = result[0];
+                hash_matrix[pair[0] as usize][pair[1] as usize] = result[1];
+            }
+
+            Ok((lz_matrix, hash_matrix))
+        }
+
         fn buf_from_slice<T>(&self, slice: &[T]) -> metal::Buffer {
             if slice.is_empty() {
                 return self.device.new_buffer(
@@ -2223,6 +2431,31 @@ pub fn run_fsm_multi_game_gpu(
     _num_actions: u32,
     _all_payoffs: &[Vec<[i32; 2]>],
 ) -> Result<Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>, String> {
+    Err("Metal not available".to_string())
+}
+
+/// Run FSM complexity computation on GPU.
+/// Returns (lz_matrix, hash_matrix).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn run_fsm_complexity_gpu(
+    fsm_ids: &[u64],
+    states: usize,
+    symbols: usize,
+    rounds: u32,
+    num_actions: u32,
+) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
+    let gpu = metal_impl::MetalFsmTournament::new(states)?;
+    gpu.run_complexity(fsm_ids, states, symbols, rounds, num_actions)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn run_fsm_complexity_gpu(
+    _fsm_ids: &[u64],
+    _states: usize,
+    _symbols: usize,
+    _rounds: u32,
+    _num_actions: u32,
+) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
     Err("Metal not available".to_string())
 }
 
