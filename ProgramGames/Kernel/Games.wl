@@ -200,29 +200,31 @@ GameRankingClasses[fsmIds_List, games_List, opts : OptionsPattern[]] :=
 			{i, 8}
 		];
 
-		(* Run 8 GPU-accelerated FSM tournaments *)
+		(* Run all 8 basis tournaments in a single GPU dispatch *)
 		tmpCell = PrintTemporary[
 			Style[StringJoin["Running 8 basis tournaments (",
-				ToString[n], " strategies, GPU=", ToString[gpu], ")..."], Gray]
+				ToString[n], " strategies, GPU=", ToString[gpu], ") [batched]..."], Gray]
 		];
-		basisResults = Table[
-			FiniteStateMachineTournament[fsmIds,
-				"States" -> s, "Colors" -> k,
-				"Rounds" -> rounds,
-				"Game" -> basisGames[[i]],
-				"GPU" -> gpu],
-			{i, 8}
+		Module[{gameStrings, resultJSON, result},
+			gameStrings = PayoffToString /@ basisGames;
+			resultJSON = FSMMultiTournamentWL[s, k, rounds,
+				ExportString[gameStrings, "RawJSON"],
+				ExportString[fsmIds, "RawJSON"],
+				gpu];
+			NotebookDelete[tmpCell];
+			If[FailureQ[resultJSON], Return[$Failed]];
+			result = ImportString[resultJSON, "RawJSON"];
+			If[KeyExistsQ[result, "error"], Return[$Failed]];
+			basisScoreMatrices = result["scores"];
 		];
-		NotebookDelete[tmpCell];
 
-		If[AnyTrue[basisResults, # === $Failed &],
-			Return[$Failed]];
-
-		strategyLabels = basisResults[[1]]["Strategies"];
+		strategyLabels = Table[
+			"fsm(" <> ToString[s] <> "," <> ToString[k] <> ")#" <> ToString[id],
+			{id, fsmIds}
+		];
 
 		(* Total-score vectors for each basis tournament *)
-		basisTotals = Total[#["Scores"], {2}] & /@ basisResults;
-		basisScoreMatrices = #["Scores"] & /@ basisResults;
+		basisTotals = Total[#, {2}] & /@ basisScoreMatrices;
 
 		(* Coefficient matrix: each game's flattened payoffs *)
 		coeffMatrix = Flatten /@ games;

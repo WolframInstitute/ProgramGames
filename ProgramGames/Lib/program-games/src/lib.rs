@@ -1634,6 +1634,124 @@ pub fn fsm_game_survey_wl(
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Batched FSM multi-tournament: runs tournaments for ALL games in a single
+/// GPU dispatch and returns the raw score matrices instead of computing winners.
+///
+/// Returns JSON: {"scores": [matrix_0, matrix_1, ...], "num_games": N, "gpu": bool}
+/// Each matrix is [[row0], [row1], ...] where matrix[i][j] = player i's score
+/// when playing as A against player j as B.
+#[wll::export]
+pub fn fsm_multi_tournament_wl(
+    states: i64,
+    symbols: i64,
+    rounds: i64,
+    games_json: String,
+    fsm_ids_json: String,
+    use_gpu: bool,
+) -> String {
+    let states = states as usize;
+    let symbols = symbols as usize;
+    let rounds_u32 = rounds as u32;
+
+    let fsm_ids: Vec<u64> = match serde_json::from_str(&fsm_ids_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"bad fsm_ids: {}\"}}", e),
+    };
+    if fsm_ids.is_empty() {
+        return "{\"error\":\"no FSM IDs provided\"}".to_string();
+    }
+
+    // Parse games: list of comma-separated payoff strings
+    let game_strings: Vec<String> = match serde_json::from_str(&games_json) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\":\"bad games: {}\"}}", e),
+    };
+    if game_strings.is_empty() {
+        return "{\"error\":\"no games provided\"}".to_string();
+    }
+
+    // Parse all payoffs
+    let mut all_dyn_payoffs = Vec::with_capacity(game_strings.len());
+    for gs in &game_strings {
+        match tournament::parse_game_dyn(gs) {
+            Ok(p) => all_dyn_payoffs.push(p),
+            Err(e) => return format!("{{\"error\":\"bad game '{}': {}\"}}", gs, e),
+        }
+    }
+    let num_actions = all_dyn_payoffs[0].num_actions;
+    let num_actions_u8 = num_actions as u8;
+
+    let used_gpu: bool;
+    let all_results: Vec<(Vec<Vec<i64>>, Vec<Vec<i64>>)>;
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        if use_gpu {
+            let all_payoff_entries: Vec<Vec<[i32; 2]>> = all_dyn_payoffs
+                .iter()
+                .map(|p| p.entries.clone())
+                .collect();
+            match gpu::run_fsm_multi_game_gpu(
+                &fsm_ids, states, symbols, rounds_u32,
+                num_actions as u32, &all_payoff_entries,
+            ) {
+                Ok(results) => {
+                    all_results = results;
+                    used_gpu = true;
+                }
+                Err(_e) => {
+                    // Fall back to CPU
+                    all_results = all_dyn_payoffs
+                        .iter()
+                        .map(|payoff| {
+                            run_fsm_tournament_cpu(
+                                &fsm_ids, states, symbols, rounds_u32, payoff, num_actions_u8,
+                            )
+                        })
+                        .collect();
+                    used_gpu = false;
+                }
+            }
+        } else {
+            all_results = all_dyn_payoffs
+                .iter()
+                .map(|payoff| {
+                    run_fsm_tournament_cpu(
+                        &fsm_ids, states, symbols, rounds_u32, payoff, num_actions_u8,
+                    )
+                })
+                .collect();
+            used_gpu = false;
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = use_gpu;
+        all_results = all_dyn_payoffs
+            .iter()
+            .map(|payoff| {
+                run_fsm_tournament_cpu(
+                    &fsm_ids, states, symbols, rounds_u32, payoff, num_actions_u8,
+                )
+            })
+            .collect();
+        used_gpu = false;
+    }
+
+    // Collect score matrices: a_scores[i][j] = player i's score as A against j as B
+    let score_matrices: Vec<Vec<Vec<i64>>> = all_results
+        .into_iter()
+        .map(|(a_scores, _b_scores)| a_scores)
+        .collect();
+
+    let output = serde_json::json!({
+        "scores": score_matrices,
+        "num_games": game_strings.len(),
+        "gpu": used_gpu,
+    });
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Compute LZ76 complexity and count-distinct for all FSM pairs.
 /// Returns JSON: {"lz": [mean_lz per FSM], "count_distinct": [cd per FSM],
 ///                "ids": [...], "gpu": bool}
