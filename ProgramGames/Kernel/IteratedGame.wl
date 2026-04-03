@@ -21,7 +21,7 @@ PackageExport["IteratedGameTuringMachine"]
 ProgramIteratedGame::usage = "ProgramIteratedGame[{strategy1, strategy2}] plays an iterated game between two strategies \
 and returns the move history as a list of {moveA, moveB} pairs. \
 Strategies: {\"TM\",id,s,k}, {\"TM\",id,s,k,maxSteps}, {\"FSM\",id,s,k}, {\"CA\",rule,k,r,t}, or any mix. \
-Options: \"Rounds\" (default 100), \"InitialHistory\" (default {}).";
+Options: \"Rounds\" (default 100), \"InitialHistory\" (default {}), \"NumActions\" (default 2).";
 
 IteratedGameFiniteStateMachine::usage = "IteratedGameFiniteStateMachine[ids] plays iterated games \
 between all pairs of FSM strategies and returns an Association of pairwise move histories.";
@@ -47,13 +47,14 @@ IteratedGameTuringMachine::err = "Game failed: ``";
 (*ProgramIteratedGame*)
 
 
-Options[ProgramIteratedGame] = {"Rounds" -> 100, "InitialHistory" -> {}};
+Options[ProgramIteratedGame] = {"Rounds" -> 100, "InitialHistory" -> {}, "NumActions" -> 2};
 
 ProgramIteratedGame[{s1_List, s2_List}, opts : OptionsPattern[]] :=
 	Module[{ndjson, initJSON, resultJSON, result},
 		ndjson = StringJoin[StrategyToJSON[s1], "\n", StrategyToJSON[s2]];
 		initJSON = ExportString[OptionValue["InitialHistory"], "RawJSON", "Compact" -> True];
-		resultJSON = IteratedGameWL[OptionValue["Rounds"], ndjson, initJSON];
+		resultJSON = IteratedGameWL[OptionValue["Rounds"], ndjson, initJSON,
+			OptionValue["NumActions"]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
 		If[KeyExistsQ[result, "error"],
@@ -66,7 +67,7 @@ ProgramIteratedGame[{s1_List, s2_List}, opts : OptionsPattern[]] :=
 (*ProgramIteratedGameCross*)
 
 
-Options[ProgramIteratedGameCross] = {"Rounds" -> 100, "InitialHistory" -> {}};
+Options[ProgramIteratedGameCross] = {"Rounds" -> 100, "InitialHistory" -> {}, "NumActions" -> 2};
 
 ProgramIteratedGameCross[leftSpecs_List, rightSpecs_List, opts : OptionsPattern[]] :=
 	Module[{leftNdjson, rightNdjson, initJSON, resultJSON, result},
@@ -74,7 +75,8 @@ ProgramIteratedGameCross[leftSpecs_List, rightSpecs_List, opts : OptionsPattern[
 		rightNdjson = StringRiffle[StrategyToJSON /@ rightSpecs, "\n"];
 		initJSON = ExportString[OptionValue["InitialHistory"], "RawJSON", "Compact" -> True];
 		resultJSON = IteratedGameCrossWL[
-			OptionValue["Rounds"], leftNdjson, rightNdjson, initJSON];
+			OptionValue["Rounds"], leftNdjson, rightNdjson, initJSON,
+			OptionValue["NumActions"]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
 		If[KeyExistsQ[result, "error"],
@@ -126,7 +128,8 @@ iParseIteratedGameCrossResult[result_] :=
 
 
 Options[IteratedGameFiniteStateMachine] = {
-	"States" -> 2, "Colors" -> 2, "Rounds" -> 100, "InitialHistory" -> {}
+	"States" -> 2, "Colors" -> 2, "Rounds" -> 100,
+	"InitialHistory" -> {}, "NumActions" -> 2
 };
 
 IteratedGameFiniteStateMachine[fsmIds_List, opts : OptionsPattern[]] :=
@@ -136,7 +139,8 @@ IteratedGameFiniteStateMachine[fsmIds_List, opts : OptionsPattern[]] :=
 		specs = {"FSM", #, s, k} & /@ fsmIds;
 		ndjson = StringRiffle[StrategyToJSON /@ specs, "\n"];
 		initJSON = ExportString[OptionValue["InitialHistory"], "RawJSON", "Compact" -> True];
-		resultJSON = IteratedGameTournamentWL[OptionValue["Rounds"], ndjson, initJSON];
+		resultJSON = IteratedGameTournamentWL[OptionValue["Rounds"], ndjson, initJSON,
+			OptionValue["NumActions"]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
 		If[KeyExistsQ[result, "error"],
@@ -150,7 +154,8 @@ IteratedGameFiniteStateMachine[fsmIds_List, opts : OptionsPattern[]] :=
 
 
 Options[IteratedGameCellularAutomaton] = {
-	"Colors" -> 2, "Radius" -> 1, "Steps" -> 10, "Rounds" -> 100, "InitialHistory" -> {}
+	"Colors" -> 2, "Radius" -> 1, "Steps" -> 10, "Rounds" -> 100,
+	"InitialHistory" -> {}, "NumActions" -> 2
 };
 
 IteratedGameCellularAutomaton[caRules_List, opts : OptionsPattern[]] :=
@@ -160,7 +165,8 @@ IteratedGameCellularAutomaton[caRules_List, opts : OptionsPattern[]] :=
 		specs = {"CA", #, k, r, OptionValue["Steps"]} & /@ caRules;
 		ndjson = StringRiffle[StrategyToJSON /@ specs, "\n"];
 		initJSON = ExportString[OptionValue["InitialHistory"], "RawJSON", "Compact" -> True];
-		resultJSON = IteratedGameTournamentWL[OptionValue["Rounds"], ndjson, initJSON];
+		resultJSON = IteratedGameTournamentWL[OptionValue["Rounds"], ndjson, initJSON,
+			OptionValue["NumActions"]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
 		If[KeyExistsQ[result, "error"],
@@ -174,7 +180,8 @@ IteratedGameCellularAutomaton[caRules_List, opts : OptionsPattern[]] :=
 
 
 Options[IteratedGameTuringMachine] = {
-	"MaxSteps" -> 500, "Rounds" -> 100, "InitialHistory" -> {}
+	"MaxSteps" -> 500, "Rounds" -> 100,
+	"InitialHistory" -> {}, "NumActions" -> 2
 };
 
 IteratedGameTuringMachine[tmIds_List, s_Integer, k_Integer, opts : OptionsPattern[]] :=
@@ -183,7 +190,8 @@ IteratedGameTuringMachine[tmIds_List, s_Integer, k_Integer, opts : OptionsPatter
 		specs = {"TM", #, s, k, maxSteps} & /@ tmIds;
 		ndjson = StringRiffle[StrategyToJSON /@ specs, "\n"];
 		initJSON = ExportString[OptionValue["InitialHistory"], "RawJSON", "Compact" -> True];
-		resultJSON = IteratedGameTournamentWL[OptionValue["Rounds"], ndjson, initJSON];
+		resultJSON = IteratedGameTournamentWL[OptionValue["Rounds"], ndjson, initJSON,
+			OptionValue["NumActions"]];
 		If[FailureQ[resultJSON], Return[$Failed]];
 		result = ImportString[resultJSON, "RawJSON"];
 		If[KeyExistsQ[result, "error"],

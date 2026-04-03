@@ -850,10 +850,12 @@ pub fn iterated_game_wl(
     rounds: i64,
     strategies_ndjson: String,
     initial_history_json: String,
+    num_actions: i64,
 ) -> String {
     let rounds = rounds as u32;
+    let na = num_actions as u8;
 
-    let specs = match tournament::parse_strategies_inline(&strategies_ndjson) {
+    let mut specs = match tournament::parse_strategies_inline(&strategies_ndjson) {
         Ok(v) => v,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e),
     };
@@ -862,6 +864,9 @@ pub fn iterated_game_wl(
             "{{\"error\":\"expected 2 strategies, got {}\"}}",
             specs.len()
         );
+    }
+    for spec in &mut specs {
+        spec.set_num_actions(na);
     }
 
     let initial_history: Vec<[u8; 2]> = if initial_history_json.trim().is_empty()
@@ -910,15 +915,20 @@ pub fn iterated_game_tournament_wl(
     rounds: i64,
     strategies_ndjson: String,
     initial_history_json: String,
+    num_actions: i64,
 ) -> String {
     let rounds = rounds as u32;
+    let na = num_actions as u8;
 
-    let specs = match tournament::parse_strategies_inline(&strategies_ndjson) {
+    let mut specs = match tournament::parse_strategies_inline(&strategies_ndjson) {
         Ok(v) => v,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e),
     };
     if specs.is_empty() {
         return "{\"error\":\"no strategies provided\"}".to_string();
+    }
+    for spec in &mut specs {
+        spec.set_num_actions(na);
     }
 
     let initial_history: Vec<[u8; 2]> = if initial_history_json.trim().is_empty()
@@ -949,19 +959,27 @@ pub fn iterated_game_cross_wl(
     left_strategies_ndjson: String,
     right_strategies_ndjson: String,
     initial_history_json: String,
+    num_actions: i64,
 ) -> String {
     let rounds = rounds as u32;
+    let na = num_actions as u8;
 
-    let left_specs = match tournament::parse_strategies_inline(&left_strategies_ndjson) {
+    let mut left_specs = match tournament::parse_strategies_inline(&left_strategies_ndjson) {
         Ok(v) => v,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e),
     };
-    let right_specs = match tournament::parse_strategies_inline(&right_strategies_ndjson) {
+    let mut right_specs = match tournament::parse_strategies_inline(&right_strategies_ndjson) {
         Ok(v) => v,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e),
     };
     if left_specs.is_empty() || right_specs.is_empty() {
         return "{\"error\":\"both strategy sets must be non-empty\"}".to_string();
+    }
+    for spec in &mut left_specs {
+        spec.set_num_actions(na);
+    }
+    for spec in &mut right_specs {
+        spec.set_num_actions(na);
     }
 
     let initial_history: Vec<[u8; 2]> = if initial_history_json.trim().is_empty()

@@ -60,6 +60,18 @@ pub enum StrategySpec {
 }
 
 impl StrategySpec {
+    /// Override num_actions on this spec.
+    pub fn set_num_actions(&mut self, na: u8) {
+        match self {
+            StrategySpec::Tm { num_actions, .. }
+            | StrategySpec::Fsm { num_actions, .. }
+            | StrategySpec::Ca { num_actions, .. }
+            | StrategySpec::RuleArray { num_actions, .. } => {
+                *num_actions = na;
+            }
+        }
+    }
+
     /// A human-readable label for this strategy.
     pub fn label(&self) -> String {
         match self {
