@@ -9,7 +9,6 @@ PacletObject[
     "PublisherID" -> "WolframInstitute",
     "Version" -> "1.0.0",
     "WolframVersion" -> "14.3+",
-    "Dependencies" -> {"PacletExtensions"},
     "PrimaryContext" -> "WolframInstitute`ProgramGames`",
     "Extensions" -> {
       {
