@@ -38,7 +38,8 @@ CellularAutomatonMaxIndex[k_Integer, r_] := With[
 Options[CellularAutomatonClassify] = {
 	"Steps" -> 10,
 	"Depth" -> 4,
-	"Sample" -> Automatic
+	"Sample" -> Automatic,
+	"Seed" -> 42
 };
 
 CellularAutomatonClassify[k_Integer, r_, opts : OptionsPattern[]] :=
@@ -53,7 +54,7 @@ CellularAutomatonClassify[k_Integer, r_, opts : OptionsPattern[]] :=
 			n_Integer :> n,
 			"all" :> 0
 		}];
-		resultJSON = CAClassifyWL[k, rNum, rDen, t, depth, sampleCount];
+		resultJSON = CAClassifyWL[k, rNum, rDen, t, depth, sampleCount, OptionValue["Seed"]];
 		If[FailureQ[resultJSON],
 			Message[CellularAutomatonClassify::rust, ToString[resultJSON, InputForm]];
 			Return[$Failed]

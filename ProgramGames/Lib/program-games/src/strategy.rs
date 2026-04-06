@@ -845,6 +845,7 @@ pub fn fsm_classify_two_step(
     actions: usize,
     sample: usize,
     trace_steps: usize,
+    seed: u64,
 ) -> Result<FsmClassification, String> {
     let total_rules = fsm_count(states, actions)
         .ok_or_else(|| "fsm space overflow".to_string())?;
@@ -865,7 +866,7 @@ pub fn fsm_classify_two_step(
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         let target = (sample as u128).min(total_rules);
-        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(42).wrapping_add(0xBu64);
+        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(seed).wrapping_add(0xBu64);
         while (seen.len() as u128) < target {
             rng_state = rng_state
                 .wrapping_mul(6364136223846793005)

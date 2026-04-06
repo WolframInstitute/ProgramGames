@@ -30,6 +30,7 @@ Options[TuringMachineProgramSearch] = {
 	"MaxSteps" -> 500,
 	"Depth" -> 4,
 	"Sample" -> Automatic,
+	"Seed" -> 42,
 	"GPU" -> True
 };
 
@@ -44,7 +45,8 @@ TuringMachineProgramSearch[s_Integer, k_Integer, opts : OptionsPattern[]] :=
 			n_Integer :> n,
 			"all" :> 0
 		}];
-		resultJSON = TMSearchWL[s, k, maxsteps, depth, sampleCount, TrueQ[OptionValue["GPU"]]];
+		resultJSON = TMSearchWL[s, k, maxsteps, depth, sampleCount,
+			TrueQ[OptionValue["GPU"]], OptionValue["Seed"]];
 		If[FailureQ[resultJSON], Return[{}]];
 		ImportString[resultJSON, "RawJSON"]
 	]
@@ -58,6 +60,7 @@ Options[TuringMachineClassify] = {
 	"MaxSteps" -> 500,
 	"Depth" -> 4,
 	"Sample" -> Automatic,
+	"Seed" -> 42,
 	"GPU" -> True
 };
 
@@ -68,6 +71,7 @@ TuringMachineClassify[s_Integer, k_Integer, opts : OptionsPattern[]] :=
 		ids = TuringMachineProgramSearch[s, k,
 			"MaxSteps" -> maxsteps, "Depth" -> depth,
 			"Sample" -> OptionValue["Sample"],
+			"Seed" -> OptionValue["Seed"],
 			"GPU" -> OptionValue["GPU"]];
 		If[Length[ids] == 0, Return[$Failed]];
 		resultJSON = TMClassifyWL[s, k, maxsteps, depth,

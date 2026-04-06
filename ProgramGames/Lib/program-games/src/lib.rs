@@ -628,6 +628,7 @@ pub fn tm_search_wl(
     depth: i64,
     sample: i64,
     use_gpu: bool,
+    seed: i64,
 ) -> String {
     let states = states as u16;
     let symbols = symbols as u8;
@@ -644,7 +645,7 @@ pub fn tm_search_wl(
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         let total_in_range = max_id + 1;
-        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(42).wrapping_add(0xBu64);
+        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(seed as u64).wrapping_add(0xBu64);
         let target = (sample as u64).min(total_in_range);
         while (seen.len() as u64) < target {
             rng_state = rng_state
@@ -1237,6 +1238,7 @@ pub fn ca_classify_wl(
     t: i64,
     depth: i64,
     sample: i64,
+    seed: i64,
 ) -> String {
     let k = k as u8;
     let r_f = r_numer as f32 / r_denom as f32;
@@ -1256,7 +1258,7 @@ pub fn ca_classify_wl(
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         let target = (sample as u64).min(total_rules);
-        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(42).wrapping_add(0xBu64);
+        let mut rng_state = 0x5DEECE66Du64.wrapping_mul(seed as u64).wrapping_add(0xBu64);
         while (seen.len() as u64) < target {
             rng_state = rng_state
                 .wrapping_mul(6364136223846793005)
@@ -1374,13 +1376,14 @@ pub fn fsm_classify_wl(
     symbols: i64,
     depth: i64,
     sample: i64,
+    seed: i64,
 ) -> String {
     let states = states as usize;
     let symbols = symbols as usize;
     let sample = if sample > 0 { sample as usize } else { 0 };
     let trace_steps = if depth > 0 { depth as usize } else { 12 };
 
-    match strategy::fsm_classify_two_step(states, symbols, sample, trace_steps) {
+    match strategy::fsm_classify_two_step(states, symbols, sample, trace_steps, seed as u64) {
         Ok(result) => {
             let group_entries: Vec<serde_json::Value> = result
                 .groups
@@ -2364,7 +2367,7 @@ mod tests {
         // For k=2, every rule is unique because table entries are already
         // in {0,1} and %2 is identity.
         // k=2, r=1/2 (numer=1, denom=2): 16 rules
-        let result_str = ca_classify_wl(2, 1, 2, 10, 4, 0);
+        let result_str = ca_classify_wl(2, 1, 2, 10, 4, 0, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let unique = parsed["unique_behaviors"].as_u64().unwrap();
         let total = parsed["total_rules"].as_u64().unwrap();
@@ -2372,7 +2375,7 @@ mod tests {
         assert_eq!(unique, 16, "k=2 r=1/2: all 16 rules should be unique");
 
         // k=2, r=1 (numer=1, denom=1): 256 rules
-        let result_str = ca_classify_wl(2, 1, 1, 10, 4, 0);
+        let result_str = ca_classify_wl(2, 1, 1, 10, 4, 0, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let unique = parsed["unique_behaviors"].as_u64().unwrap();
         let total = parsed["total_rules"].as_u64().unwrap();
@@ -2385,7 +2388,7 @@ mod tests {
         // k=3, r=1/2: output %2 collapses 0 and 2, so there must be
         // fewer unique behaviors than total rules.
         // Total = 3^(3^2) = 3^9 = 19683
-        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0);
+        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let total = parsed["total_rules"].as_u64().unwrap();
         let unique = parsed["unique_behaviors"].as_u64().unwrap();
@@ -2409,7 +2412,7 @@ mod tests {
         // Sampling k=2 rules should still find all unique (no collisions)
         // since every k=2 rule is behaviorally distinct.
         // Use a small sample from a large space (k=2, r=3/2: 65536 rules)
-        let result_str = ca_classify_wl(2, 3, 2, 10, 4, 1000);
+        let result_str = ca_classify_wl(2, 3, 2, 10, 4, 1000, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let sampled = parsed["sampled_rules"].as_u64().unwrap();
         let unique = parsed["unique_behaviors"].as_u64().unwrap();
@@ -2426,7 +2429,7 @@ mod tests {
         // k=4, r=1/2: output %2 collapses {0,2}->0, {1,3}->1
         // Total = 4^(4^2) = 4^16 = 4294967296 (too big for exhaustive)
         // Sample and verify there ARE equivalences
-        let result_str = ca_classify_wl(4, 1, 2, 10, 4, 10000);
+        let result_str = ca_classify_wl(4, 1, 2, 10, 4, 10000, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let sampled = parsed["sampled_rules"].as_u64().unwrap();
         let unique = parsed["unique_behaviors"].as_u64().unwrap();
@@ -2443,7 +2446,7 @@ mod tests {
     #[test]
     fn ca_classify_reduction_factor_correct() {
         // Verify reduction_factor = sampled_rules / unique_behaviors
-        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0);
+        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let sampled = parsed["sampled_rules"].as_f64().unwrap();
         let unique = parsed["unique_behaviors"].as_f64().unwrap();
@@ -2459,7 +2462,7 @@ mod tests {
     #[test]
     fn ca_classify_group_sizes_sum_to_sampled() {
         // Every classified rule should appear in exactly one group
-        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0);
+        let result_str = ca_classify_wl(3, 1, 2, 10, 4, 0, 42);
         let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
         let sampled = parsed["sampled_rules"].as_u64().unwrap();
         let groups = parsed["groups"].as_array().unwrap();
@@ -2790,7 +2793,7 @@ mod tests {
         eprintln!("  {}", "-".repeat(62));
 
         for (s, k) in [(1, 2), (2, 2), (3, 2), (4, 2)] {
-            let result_str = fsm_classify_wl(s, k as i64, 4, 0);
+            let result_str = fsm_classify_wl(s, k as i64, 4, 0, 42);
             let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
             let total = parsed["total_rules"].as_u64().unwrap();
             let canonical = parsed["canonical_count"].as_u64().unwrap();

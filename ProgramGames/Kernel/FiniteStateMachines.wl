@@ -34,7 +34,8 @@ FiniteStateMachineMaxIndex[s_Integer, k_Integer] := s^(s k) k^s
 
 Options[FiniteStateMachineClassify] = {
 	"Depth" -> 4,
-	"Sample" -> Automatic
+	"Sample" -> Automatic,
+	"Seed" -> 42
 };
 
 FiniteStateMachineClassify[s_Integer, k_Integer, opts : OptionsPattern[]] :=
@@ -47,7 +48,7 @@ FiniteStateMachineClassify[s_Integer, k_Integer, opts : OptionsPattern[]] :=
 			n_Integer :> n,
 			"all" :> 0
 		}];
-		resultJSON = FSMClassifyWL[s, k, depth, sampleCount];
+		resultJSON = FSMClassifyWL[s, k, depth, sampleCount, OptionValue["Seed"]];
 		If[FailureQ[resultJSON],
 			Message[FiniteStateMachineClassify::rust, ToString[resultJSON, InputForm]];
 			Return[$Failed]
