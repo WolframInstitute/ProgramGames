@@ -858,6 +858,7 @@ pub struct IteratedGameTournamentOutput {
     pub num_strategies: usize,
     pub num_pairs: usize,
     pub games: Vec<IteratedGamePairOutput>,
+    pub failed: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -870,13 +871,13 @@ pub struct IteratedGamePairOutput {
 }
 
 /// Run an iterated game tournament on CPU, returning full move histories for all pairs.
-/// Returns (survivor_indices, game_outputs).
-/// Non-halting strategies (TMs that don't halt) are excluded.
+/// Returns (survivor_indices, failed_indices, game_outputs).
+/// Games involving non-halting strategies get empty histories.
 pub fn run_iterated_game_tournament(
     specs: &[StrategySpec],
     rounds: u32,
     initial_history: &[[u8; 2]],
-) -> (Vec<usize>, Vec<IteratedGamePairOutput>) {
+) -> (Vec<usize>, Vec<usize>, Vec<IteratedGamePairOutput>) {
     let n = specs.len();
     let pairs = all_pairs(n);
 
@@ -922,13 +923,15 @@ pub fn run_iterated_game_tournament(
     if !failed.is_empty() {
         let failed_labels: Vec<String> = failed.iter().map(|&i| specs[i].label()).collect();
         eprintln!(
-            "  Excluded {} non-halting strategies: {:?}",
+            "  {} non-halting strategies: {:?}",
             failed.len(),
             failed_labels
         );
     }
 
     let survivors: Vec<usize> = (0..n).filter(|i| !failed.contains(i)).collect();
+    let mut failed_sorted: Vec<usize> = failed.iter().copied().collect();
+    failed_sorted.sort();
     let labels: Vec<String> = specs.iter().map(|s| s.label()).collect();
 
     let games: Vec<IteratedGamePairOutput> = results
@@ -943,12 +946,13 @@ pub fn run_iterated_game_tournament(
         })
         .collect();
 
-    (survivors, games)
+    (survivors, failed_sorted, games)
 }
 
 /// Build output for an iterated game tournament.
 pub fn build_iterated_game_output(
     specs: &[StrategySpec],
+    failed: Vec<usize>,
     games: Vec<IteratedGamePairOutput>,
     rounds: u32,
 ) -> IteratedGameTournamentOutput {
@@ -960,6 +964,7 @@ pub fn build_iterated_game_output(
         num_strategies: n,
         num_pairs: games.len(),
         games,
+        failed,
     }
 }
 

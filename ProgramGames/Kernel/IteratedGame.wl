@@ -90,17 +90,19 @@ ProgramIteratedGameCross[leftSpecs_List, rightSpecs_List, opts : OptionsPattern[
 
 
 iParseIteratedGameResult[result_] :=
-	Module[{strategies, games},
+	Module[{strategies, games, failed},
 		strategies = result["strategies"];
 		games = Association[
 			{iParseLabel[#["label_a"]], iParseLabel[#["label_b"]]} -> #["history"] & /@ result["games"]
 		];
+		failed = Lookup[result, "failed", {}];
 		<|
 			"Strategies" -> (iParseLabel /@ strategies),
 			"Games" -> games,
 			"Rounds" -> result["rounds"],
 			"NumStrategies" -> result["num_strategies"],
-			"NumPairs" -> result["num_pairs"]
+			"NumPairs" -> result["num_pairs"],
+			"Failed" -> failed
 		|>
 	]
 

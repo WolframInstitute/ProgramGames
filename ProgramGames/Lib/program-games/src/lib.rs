@@ -945,10 +945,10 @@ pub fn iterated_game_tournament_wl(
         }
     };
 
-    let (survivors, games) =
+    let (survivors, failed, games) =
         tournament::run_iterated_game_tournament(&specs, rounds, &initial_history);
     let surviving_specs: Vec<_> = survivors.iter().map(|&i| specs[i].clone()).collect();
-    let output = tournament::build_iterated_game_output(&surviving_specs, games, rounds);
+    let output = tournament::build_iterated_game_output(&surviving_specs, failed, games, rounds);
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
