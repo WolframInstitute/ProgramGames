@@ -848,6 +848,7 @@ pub struct IteratedGameOutput {
     pub label_b: String,
     pub history: Vec<[u8; 2]>,
     pub rounds: u32,
+    pub failed: u8,
 }
 
 /// Output for an iterated game tournament (all pairs, with histories).

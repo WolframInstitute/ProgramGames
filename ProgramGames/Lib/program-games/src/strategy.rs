@@ -1095,7 +1095,8 @@ pub fn play_game_with_history(
         prev_b = mb;
     }
 
-    // Play new rounds
+    // Play new rounds (255 = sentinel for non-halting TM)
+    let mut failed: u8 = 0;
     for round in init_len..total {
         let move_a = if runner_a.is_fsm() {
             runner_a.get_fsm_move(prev_b, round)
@@ -1104,7 +1105,7 @@ pub fn play_game_with_history(
         };
         let move_a = match move_a {
             Some(m) => m,
-            None => return (move_history, 1),
+            None => { failed |= 1; 255 },
         };
         let move_b = if runner_b.is_fsm() {
             runner_b.get_fsm_move(prev_a, round)
@@ -1113,7 +1114,7 @@ pub fn play_game_with_history(
         };
         let move_b = match move_b {
             Some(m) => m,
-            None => return (move_history, 2),
+            None => { failed |= 2; 255 },
         };
 
         flat_history.push(move_a);
@@ -1123,7 +1124,7 @@ pub fn play_game_with_history(
         prev_b = move_b;
     }
 
-    (move_history, 0)
+    (move_history, failed)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

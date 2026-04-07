@@ -892,16 +892,10 @@ pub fn iterated_game_wl(
         &initial_history,
     );
 
-    if failed != 0 {
-        return format!(
-            "{{\"error\":\"strategy failed to halt (flag={})\"}}",
-            failed
-        );
-    }
-
     let output = tournament::IteratedGameOutput {
         label_a: specs[0].label(),
         label_b: specs[1].label(),
+        failed,
         history,
         rounds,
     };

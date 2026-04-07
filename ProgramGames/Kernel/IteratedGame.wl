@@ -59,7 +59,7 @@ ProgramIteratedGame[{s1_List, s2_List}, opts : OptionsPattern[]] :=
 		result = ImportString[resultJSON, "RawJSON"];
 		If[KeyExistsQ[result, "error"],
 			Message[ProgramIteratedGame::err, result["error"]]; Return[$Failed]];
-		result["history"]
+		result["history"] /. 255 -> Undefined
 	]
 
 
