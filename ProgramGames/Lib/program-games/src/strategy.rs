@@ -8,6 +8,98 @@ use serde::Deserialize;
 use crate::tournament::{DynPayoff, Payoff};
 use crate::TmTransition;
 
+// ── Flexible ID deserializer (accepts JSON number or string) ───────────────
+
+fn deserialize_big_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct IdVisitor;
+    impl<'de> serde::de::Visitor<'de> for IdVisitor {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a number or numeric string")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<String, E> {
+            Ok((v as u64).to_string())
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+    }
+    deserializer.deserialize_any(IdVisitor)
+}
+
+// ── Bigint-style base conversion from decimal string ───────────────────────
+
+/// Divide a decimal digit vector by `divisor`, returning the remainder.
+fn div_decimal_vec(num: &mut Vec<u8>, divisor: u64) -> u64 {
+    let mut remainder = 0u128;
+    for d in num.iter_mut() {
+        remainder = remainder * 10 + *d as u128;
+        *d = (remainder / divisor as u128) as u8;
+        remainder %= divisor as u128;
+    }
+    // Strip leading zeros
+    while num.len() > 1 && num[0] == 0 {
+        num.remove(0);
+    }
+    remainder as u64
+}
+
+/// Convert a decimal string to digits in the given base (MSD first).
+fn string_to_base_digits(id_str: &str, base: u64, len: usize) -> Vec<u64> {
+    let mut decimal: Vec<u8> = id_str.bytes().map(|b| b - b'0').collect();
+    let mut digits = vec![0u64; len];
+    for i in (0..len).rev() {
+        digits[i] = div_decimal_vec(&mut decimal, base);
+    }
+    digits
+}
+
+/// Decode a TM from a decimal string ID (supports arbitrarily large IDs).
+fn decode_tm_from_str(id_str: &str, states: u16, symbols: u8) -> Vec<TmTransition> {
+    // Fast path for ids that fit in u64
+    if let Ok(code) = id_str.parse::<u64>() {
+        return crate::decode_tm(code, states, symbols);
+    }
+
+    let s = states as usize;
+    let k = symbols as usize;
+    let total = s * k;
+    let base = (k * s * 2) as u64;
+
+    let mut transitions = vec![
+        TmTransition { write: 0, move_right: false, next: 1 };
+        total
+    ];
+    if base == 0 {
+        return transitions;
+    }
+
+    let mut decimal: Vec<u8> = id_str.bytes().map(|b| b - b'0').collect();
+    for state in (1..=s).rev() {
+        for read in 0..k {
+            let digit = div_decimal_vec(&mut decimal, base);
+            let move_right = (digit % 2) == 1;
+            let write = ((digit / 2) % k as u64) as u8;
+            let next = (digit / (2 * k as u64)) as u16 + 1;
+            let idx = (state - 1) * k + read;
+            transitions[idx] = TmTransition { write, move_right, next };
+        }
+    }
+    transitions
+}
+
 // ── Strategy specification (JSON-deserializable) ─────────────────────────────
 
 fn default_max_steps() -> u32 {
@@ -23,7 +115,8 @@ fn default_num_actions() -> u8 {
 pub enum StrategySpec {
     #[serde(rename = "tm")]
     Tm {
-        id: u64,
+        #[serde(deserialize_with = "deserialize_big_id")]
+        id: String,
         s: u16,
         k: u8,
         #[serde(default = "default_max_steps")]
@@ -33,7 +126,8 @@ pub enum StrategySpec {
     },
     #[serde(rename = "fsm")]
     Fsm {
-        id: u64,
+        #[serde(deserialize_with = "deserialize_big_id")]
+        id: String,
         s: u16,
         k: u8,
         #[serde(default = "default_num_actions")]
@@ -41,7 +135,8 @@ pub enum StrategySpec {
     },
     #[serde(rename = "ca")]
     Ca {
-        rule: u64,
+        #[serde(deserialize_with = "deserialize_big_id")]
+        rule: String,
         k: u8,
         r: f32,
         t: u32,
@@ -142,7 +237,7 @@ impl StrategyRunner {
                 max_steps,
                 num_actions,
             } => {
-                let transitions = crate::decode_tm(*id, *s, *k);
+                let transitions = decode_tm_from_str(id, *s, *k);
                 RunnerInner::Tm {
                     transitions,
                     symbols: *k,
@@ -151,8 +246,9 @@ impl StrategyRunner {
                 }
             }
             StrategySpec::Fsm { id, s, k, num_actions } => {
+                let id_u64 = id.parse::<u64>().unwrap_or(0);
                 let (outputs, transitions) =
-                    decode_fsm(*id, *s as usize, *k as usize);
+                    decode_fsm(id_u64, *s as usize, *k as usize);
                 RunnerInner::Fsm {
                     state: 0,
                     outputs,
@@ -163,7 +259,8 @@ impl StrategyRunner {
             }
             StrategySpec::Ca { rule, k, r, t, num_actions } => {
                 let two_r = (2.0 * r).round() as u32;
-                let rule_table = decode_ca_rule_table(*rule, *k, two_r);
+                let rule_u64 = rule.parse::<u64>().unwrap_or(0);
+                let rule_table = decode_ca_rule_table(rule_u64, *k, two_r);
                 RunnerInner::Ca {
                     rule_table,
                     k: *k,
@@ -1095,7 +1192,65 @@ pub fn play_game_with_history(
         prev_b = mb;
     }
 
-    // Play new rounds (255 = sentinel for non-halting TM)
+    // Play new rounds (abort on non-halt for tournament safety)
+    for round in init_len..total {
+        let move_a = if runner_a.is_fsm() {
+            runner_a.get_fsm_move(prev_b, round)
+        } else {
+            runner_a.get_move(&flat_history, round)
+        };
+        let move_a = match move_a {
+            Some(m) => m,
+            None => return (move_history, 1),
+        };
+        let move_b = if runner_b.is_fsm() {
+            runner_b.get_fsm_move(prev_a, round)
+        } else {
+            runner_b.get_move(&flat_history, round)
+        };
+        let move_b = match move_b {
+            Some(m) => m,
+            None => return (move_history, 2),
+        };
+
+        flat_history.push(move_a);
+        flat_history.push(move_b);
+        move_history.push([move_a, move_b]);
+        prev_a = move_a;
+        prev_b = move_b;
+    }
+
+    (move_history, 0)
+}
+
+/// Like `play_game_with_history` but continues on non-halt using sentinel 255.
+/// Used by ProgramIteratedGame to show Undefined moves instead of aborting.
+pub fn play_game_with_history_sentinel(
+    runner_a: &mut StrategyRunner,
+    runner_b: &mut StrategyRunner,
+    rounds: u32,
+    initial_history: &[[u8; 2]],
+) -> (Vec<[u8; 2]>, u8) {
+    runner_a.reset();
+    runner_b.reset();
+
+    let init_len = initial_history.len() as u32;
+    let total = init_len + rounds;
+    let mut flat_history: Vec<u8> = Vec::with_capacity(2 * total as usize);
+    let mut move_history: Vec<[u8; 2]> = Vec::with_capacity(total as usize);
+    let mut prev_a: u8 = 0;
+    let mut prev_b: u8 = 0;
+
+    for (round, &[ma, mb]) in initial_history.iter().enumerate() {
+        if runner_a.is_fsm() { runner_a.get_fsm_move(prev_b, round as u32); }
+        if runner_b.is_fsm() { runner_b.get_fsm_move(prev_a, round as u32); }
+        flat_history.push(ma);
+        flat_history.push(mb);
+        move_history.push([ma, mb]);
+        prev_a = ma;
+        prev_b = mb;
+    }
+
     let mut failed: u8 = 0;
     for round in init_len..total {
         let move_a = if runner_a.is_fsm() {
@@ -1214,7 +1369,7 @@ mod tests {
 
     #[test]
     fn fsm_runner_cooperates_on_round_0() {
-        let spec = StrategySpec::Fsm { id: 0, s: 2, k: 2, num_actions: 2 };
+        let spec = StrategySpec::Fsm { id: "0".to_string(), s: 2, k: 2, num_actions: 2 };
         let mut runner = StrategyRunner::new(&spec);
         let m = runner.get_move(&[], 0).unwrap();
         // FSM outputs based on initial state; the exact value depends on the FSM
@@ -1224,7 +1379,7 @@ mod tests {
     #[test]
     fn fsm_runner_stateful_across_rounds() {
         // Create an FSM and verify it can change state
-        let spec = StrategySpec::Fsm { id: 47, s: 2, k: 2, num_actions: 2 };
+        let spec = StrategySpec::Fsm { id: "47".to_string(), s: 2, k: 2, num_actions: 2 };
         let mut runner = StrategyRunner::new(&spec);
         let m0 = runner.get_move(&[], 0).unwrap();
         let m1 = runner.get_move(&[m0, 1], 1).unwrap();
@@ -1234,7 +1389,7 @@ mod tests {
 
     #[test]
     fn fsm_runner_reset_restores_state() {
-        let spec = StrategySpec::Fsm { id: 47, s: 2, k: 2, num_actions: 2 };
+        let spec = StrategySpec::Fsm { id: "47".to_string(), s: 2, k: 2, num_actions: 2 };
         let mut runner = StrategyRunner::new(&spec);
         let m0 = runner.get_move(&[], 0).unwrap();
         let _ = runner.get_move(&[m0, 1], 1).unwrap();
@@ -1315,7 +1470,7 @@ mod tests {
     #[test]
     fn ca_runner_cooperates_round_0() {
         let spec = StrategySpec::Ca {
-            rule: 110,
+            rule: "110".to_string(),
             k: 2,
             r: 1.0,
             t: 10,
@@ -1328,7 +1483,7 @@ mod tests {
     #[test]
     fn ca_runner_produces_valid_moves() {
         let spec = StrategySpec::Ca {
-            rule: 110,
+            rule: "110".to_string(),
             k: 2,
             r: 1.0,
             t: 2,
@@ -1426,7 +1581,7 @@ mod tests {
     #[test]
     fn tm_runner_cooperates_round_0() {
         let spec = StrategySpec::Tm {
-            id: 64,
+            id: "64".to_string(),
             s: 2,
             k: 2,
             max_steps: 500,
@@ -1440,7 +1595,7 @@ mod tests {
     fn tm_runner_matches_cpu_play() {
         // TM 64 always cooperates, so should produce 0 on any history
         let spec = StrategySpec::Tm {
-            id: 64,
+            id: "64".to_string(),
             s: 2,
             k: 2,
             max_steps: 500,
@@ -1457,14 +1612,14 @@ mod tests {
     #[test]
     fn play_game_tm_vs_tm_cooperator() {
         let spec_a = StrategySpec::Tm {
-            id: 64,
+            id: "64".to_string(),
             s: 2,
             k: 2,
             max_steps: 500,
             num_actions: 2,
         };
         let spec_b = StrategySpec::Tm {
-            id: 64,
+            id: "64".to_string(),
             s: 2,
             k: 2,
             max_steps: 500,
@@ -1482,8 +1637,8 @@ mod tests {
 
     #[test]
     fn play_game_fsm_vs_fsm() {
-        let spec_a = StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 };
-        let spec_b = StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 };
+        let spec_a = StrategySpec::Fsm { id: "1".to_string(), s: 1, k: 2, num_actions: 2 };
+        let spec_b = StrategySpec::Fsm { id: "0".to_string(), s: 1, k: 2, num_actions: 2 };
         let mut runner_a = StrategyRunner::new(&spec_a);
         let mut runner_b = StrategyRunner::new(&spec_b);
         let payoff = crate::tournament::parse_game("pd").unwrap();
@@ -1497,13 +1652,13 @@ mod tests {
     #[test]
     fn play_game_mixed_strategies() {
         let spec_a = StrategySpec::Tm {
-            id: 64,
+            id: "64".to_string(),
             s: 2,
             k: 2,
             max_steps: 500,
             num_actions: 2,
         };
-        let spec_b = StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 };
+        let spec_b = StrategySpec::Fsm { id: "0".to_string(), s: 1, k: 2, num_actions: 2 };
         let mut runner_a = StrategyRunner::new(&spec_a);
         let mut runner_b = StrategyRunner::new(&spec_b);
         let payoff = crate::tournament::parse_game("pd").unwrap();
@@ -1522,7 +1677,7 @@ mod tests {
         let spec: StrategySpec = serde_json::from_str(json).unwrap();
         match spec {
             StrategySpec::Tm { id, s, k, max_steps, num_actions } => {
-                assert_eq!(id, 323);
+                assert_eq!(id, "323");
                 assert_eq!(s, 2);
                 assert_eq!(k, 2);
                 assert_eq!(max_steps, 500); // default
@@ -1548,7 +1703,7 @@ mod tests {
         let spec: StrategySpec = serde_json::from_str(json).unwrap();
         match spec {
             StrategySpec::Fsm { id, s, k, num_actions } => {
-                assert_eq!(id, 47);
+                assert_eq!(id, "47");
                 assert_eq!(s, 2);
                 assert_eq!(k, 2);
                 assert_eq!(num_actions, 2); // default
@@ -1563,7 +1718,7 @@ mod tests {
         let spec: StrategySpec = serde_json::from_str(json).unwrap();
         match spec {
             StrategySpec::Ca { rule, k, r, t, num_actions } => {
-                assert_eq!(rule, 110);
+                assert_eq!(rule, "110");
                 assert_eq!(k, 2);
                 assert!((r - 1.0).abs() < f32::EPSILON);
                 assert_eq!(t, 10);

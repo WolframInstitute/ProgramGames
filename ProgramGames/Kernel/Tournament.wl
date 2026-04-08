@@ -54,18 +54,18 @@ PayoffToString[game_String] := game
 
 
 StrategyToJSON[{"TM", id_Integer, s_Integer, k_Integer}] :=
-	ExportString[<|"type" -> "tm", "id" -> id, "s" -> s, "k" -> k|>,
+	ExportString[<|"type" -> "tm", "id" -> ToString[id], "s" -> s, "k" -> k|>,
 		"RawJSON", "Compact" -> True]
 StrategyToJSON[{"TM", id_Integer, s_Integer, k_Integer, ms_Integer}] :=
-	ExportString[<|"type" -> "tm", "id" -> id, "s" -> s, "k" -> k,
+	ExportString[<|"type" -> "tm", "id" -> ToString[id], "s" -> s, "k" -> k,
 		"max_steps" -> ms|>, "RawJSON", "Compact" -> True]
 StrategyToJSON[{"FSM", id_Integer, s_Integer, k_Integer}] :=
-	ExportString[<|"type" -> "fsm", "id" -> id, "s" -> s, "k" -> k|>,
+	ExportString[<|"type" -> "fsm", "id" -> ToString[id], "s" -> s, "k" -> k|>,
 		"RawJSON", "Compact" -> True]
 StrategyToJSON[{"CA", rule_Integer, k_Integer, r_}] :=
 	StrategyToJSON[{"CA", rule, k, r, 10}]
 StrategyToJSON[{"CA", rule_Integer, k_Integer, r_, t_Integer}] :=
-	ExportString[<|"type" -> "ca", "rule" -> rule, "k" -> k,
+	ExportString[<|"type" -> "ca", "rule" -> ToString[rule], "k" -> k,
 		"r" -> N[r], "t" -> t|>, "RawJSON", "Compact" -> True]
 StrategyToJSON[{"RA", rules_List, k_Integer, r_, t_Integer}] :=
 	ExportString[<|"type" -> "rule_array", "rules" -> rules, "k" -> k,

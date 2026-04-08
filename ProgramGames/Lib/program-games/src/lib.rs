@@ -885,7 +885,7 @@ pub fn iterated_game_wl(
 
     let mut runner_a = strategy::StrategyRunner::new(&specs[0]);
     let mut runner_b = strategy::StrategyRunner::new(&specs[1]);
-    let (history, failed) = strategy::play_game_with_history(
+    let (history, failed) = strategy::play_game_with_history_sentinel(
         &mut runner_a,
         &mut runner_b,
         rounds,
@@ -1097,7 +1097,7 @@ pub fn ca_tournament_wl(
     // Build output using mixed-output format with CA specs
     let specs: Vec<strategy::StrategySpec> = rule_ids
         .iter()
-        .map(|&rule| strategy::StrategySpec::Ca { rule, k, r: r_f, t, num_actions })
+        .map(|&rule| strategy::StrategySpec::Ca { rule: rule.to_string(), k, r: r_f, t, num_actions })
         .collect();
     let output = tournament::build_mixed_output(&specs, a_scores, b_scores, rounds, &game);
     let mut json_val = serde_json::to_value(&output).unwrap_or(serde_json::json!({}));
@@ -1122,7 +1122,7 @@ fn run_ca_tournament_cpu(
     let r_f = two_r as f32 / 2.0;
     let specs: Vec<strategy::StrategySpec> = rule_ids
         .iter()
-        .map(|&rule| strategy::StrategySpec::Ca { rule, k, r: r_f, t, num_actions })
+        .map(|&rule| strategy::StrategySpec::Ca { rule: rule.to_string(), k, r: r_f, t, num_actions })
         .collect();
 
     // Play all ordered pairs in parallel
@@ -1485,7 +1485,7 @@ pub fn fsm_tournament_wl(
     let specs: Vec<strategy::StrategySpec> = fsm_ids
         .iter()
         .map(|&id| strategy::StrategySpec::Fsm {
-            id,
+            id: id.to_string(),
             s: states as u16,
             k: symbols as u8,
             num_actions,
@@ -1513,7 +1513,7 @@ fn run_fsm_tournament_cpu(
     let specs: Vec<strategy::StrategySpec> = fsm_ids
         .iter()
         .map(|&id| strategy::StrategySpec::Fsm {
-            id,
+            id: id.to_string(),
             s: states as u16,
             k: symbols as u8,
             num_actions,
@@ -1558,7 +1558,7 @@ fn run_fsm_complexity_cpu(
     let specs: Vec<strategy::StrategySpec> = fsm_ids
         .iter()
         .map(|&id| strategy::StrategySpec::Fsm {
-            id,
+            id: id.to_string(),
             s: states as u16,
             k: symbols as u8,
             num_actions,
@@ -1691,7 +1691,7 @@ pub fn fsm_game_survey_wl(
     let specs: Vec<strategy::StrategySpec> = fsm_ids
         .iter()
         .map(|&id| strategy::StrategySpec::Fsm {
-            id,
+            id: id.to_string(),
             s: states as u16,
             k: symbols as u8,
             num_actions: num_actions_u8,

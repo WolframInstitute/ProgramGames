@@ -1286,8 +1286,8 @@ mod tests {
         // A mixed tournament with only TMs should produce the same results
         // as the TM-only tournament.
         let specs = vec![
-            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500, num_actions: 2 },
-            StrategySpec::Tm { id: 65, s: 2, k: 2, max_steps: 500, num_actions: 2 },
+            StrategySpec::Tm { id: "64".to_string(), s: 2, k: 2, max_steps: 500, num_actions: 2 },
+            StrategySpec::Tm { id: "65".to_string(), s: 2, k: 2, max_steps: 500, num_actions: 2 },
         ];
         let payoff = parse_game_dyn("pd").unwrap();
         let (survivors, a_scores, b_scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
@@ -1304,8 +1304,8 @@ mod tests {
     #[test]
     fn mixed_tournament_fsm_cooperator_vs_defector() {
         let specs = vec![
-            StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 },
-            StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Fsm { id: "1".to_string(), s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Fsm { id: "0".to_string(), s: 1, k: 2, num_actions: 2 },
         ];
         let payoff = parse_game_dyn("pd").unwrap();
         let (survivors, a_scores, b_scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
@@ -1319,9 +1319,9 @@ mod tests {
     #[test]
     fn mixed_tournament_three_types() {
         let specs = vec![
-            StrategySpec::Tm { id: 64, s: 2, k: 2, max_steps: 500, num_actions: 2 },
-            StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
-            StrategySpec::Ca { rule: 110, k: 2, r: 1.0, t: 2, num_actions: 2 },
+            StrategySpec::Tm { id: "64".to_string(), s: 2, k: 2, max_steps: 500, num_actions: 2 },
+            StrategySpec::Fsm { id: "0".to_string(), s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Ca { rule: "110".to_string(), k: 2, r: 1.0, t: 2, num_actions: 2 },
         ];
         let payoff = parse_game_dyn("pd").unwrap();
         let (survivors, a_scores, b_scores) = run_mixed_tournament_cpu(&specs, 10, &payoff);
@@ -1337,8 +1337,8 @@ mod tests {
     #[test]
     fn mixed_output_ranking_sorted() {
         let specs = vec![
-            StrategySpec::Fsm { id: 0, s: 1, k: 2, num_actions: 2 },
-            StrategySpec::Fsm { id: 1, s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Fsm { id: "0".to_string(), s: 1, k: 2, num_actions: 2 },
+            StrategySpec::Fsm { id: "1".to_string(), s: 1, k: 2, num_actions: 2 },
         ];
         let a_scores = vec![vec![0, -30], vec![0, 0]];
         let b_scores = vec![vec![0, 0], vec![-30, 0]];
