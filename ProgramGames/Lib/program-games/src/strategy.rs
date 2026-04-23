@@ -246,9 +246,8 @@ impl StrategyRunner {
                 }
             }
             StrategySpec::Fsm { id, s, k, num_actions } => {
-                let id_u64 = id.parse::<u64>().unwrap_or(0);
                 let (outputs, transitions) =
-                    decode_fsm(id_u64, *s as usize, *k as usize);
+                    decode_fsm_from_str(id, *s as usize, *k as usize);
                 RunnerInner::Fsm {
                     state: 0,
                     outputs,
@@ -259,8 +258,7 @@ impl StrategyRunner {
             }
             StrategySpec::Ca { rule, k, r, t, num_actions } => {
                 let two_r = (2.0 * r).round() as u32;
-                let rule_u64 = rule.parse::<u64>().unwrap_or(0);
-                let rule_table = decode_ca_rule_table(rule_u64, *k, two_r);
+                let rule_table = decode_ca_rule_table_from_str(rule, *k, two_r);
                 RunnerInner::Ca {
                     rule_table,
                     k: *k,
@@ -518,6 +516,83 @@ pub fn decode_fsm(index: u64, states: usize, actions: usize) -> (Vec<u8>, Vec<us
     (outputs, transitions)
 }
 
+/// Decode an FSM from a decimal string ID, supporting IDs that exceed `u64::MAX`.
+///
+/// For `(s, k)` where `s^(s*k) * k^s` exceeds `u64::MAX` (e.g. s=9, k=2 has ~7.68e19
+/// total FSMs, about 4.17x u64::MAX), valid FSM indices can be larger than a u64.
+/// This function decomposes the decimal string directly via bigint long division,
+/// matching the encoding of `decode_fsm` exactly on the u64 range.
+pub fn decode_fsm_from_str(id_str: &str, states: usize, actions: usize) -> (Vec<u8>, Vec<usize>) {
+    // Fast path: id fits in u64. Delegates to `decode_fsm` so the signed-abs
+    // handling for index=0 is preserved.
+    if let Ok(idx) = id_str.parse::<u64>() {
+        return decode_fsm(idx, states, actions);
+    }
+
+    if states == 0 || actions == 0 {
+        return (vec![], vec![]);
+    }
+
+    // Any id that fails u64 parsing is > u64::MAX, so (index - 1) is strictly
+    // positive — no signed-abs case to worry about.
+    let mut decimal: Vec<u8> = id_str
+        .bytes()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| b - b'0')
+        .collect();
+    let all_zero = decimal.iter().all(|&d| d == 0);
+    if decimal.is_empty() || all_zero {
+        return decode_fsm(0, states, actions);
+    }
+
+    // Subtract 1 in place.
+    let mut i = decimal.len();
+    while i > 0 {
+        i -= 1;
+        if decimal[i] > 0 {
+            decimal[i] -= 1;
+            break;
+        }
+        decimal[i] = 9;
+    }
+    while decimal.len() > 1 && decimal[0] == 0 {
+        decimal.remove(0);
+    }
+
+    let n = states * actions;
+
+    // Encoding: (index - 1) = transition_code * k^s + output_code.
+    // Repeated division by k (s times) peels off the output digits LSD-first;
+    // the remaining quotient is the transition_code, which we then peel apart
+    // by repeated division by s (n times).
+    let mut output_digits = vec![0usize; states];
+    if actions > 1 {
+        for idx in (0..states).rev() {
+            output_digits[idx] = div_decimal_vec(&mut decimal, actions as u64) as usize;
+        }
+    }
+
+    let mut next_digits = vec![0usize; n];
+    if states > 1 {
+        for idx in (0..n).rev() {
+            next_digits[idx] = div_decimal_vec(&mut decimal, states as u64) as usize;
+        }
+    }
+
+    let outputs: Vec<u8> = output_digits.into_iter().map(|d| d as u8).collect();
+
+    let mut transitions = vec![0usize; n];
+    for state_idx in 0..states {
+        for input_idx in 0..actions {
+            let flat_idx = state_idx * actions + input_idx;
+            let next = next_digits.get(flat_idx).copied().unwrap_or(0);
+            transitions[flat_idx] = next.min(states - 1);
+        }
+    }
+
+    (outputs, transitions)
+}
+
 /// Count total FSMs for given (states, actions): s^(s*k) * k^s
 #[allow(dead_code)]
 pub fn fsm_count(states: usize, actions: usize) -> Option<u128> {
@@ -544,6 +619,34 @@ pub fn decode_ca_rule_table(rule_code: u64, k: u8, two_r: u32) -> Vec<u8> {
         .collect();
     // IntegerDigits gives MSD-first; reverse to get LSD-first (matching WL convention)
     table.reverse();
+    table
+}
+
+/// Decode a CA rule from a decimal string, supporting rules that exceed `u64::MAX`.
+/// Delegates to `decode_ca_rule_table` for ids that fit in u64.
+pub fn decode_ca_rule_table_from_str(rule_str: &str, k: u8, two_r: u32) -> Vec<u8> {
+    if let Ok(code) = rule_str.parse::<u64>() {
+        return decode_ca_rule_table(code, k, two_r);
+    }
+
+    let neighborhood = two_r as usize + 1;
+    let k_usize = k.max(2) as usize;
+    let table_len = checked_pow_usize(k_usize, neighborhood).unwrap_or(0);
+
+    let mut decimal: Vec<u8> = rule_str
+        .bytes()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| b - b'0')
+        .collect();
+    if decimal.is_empty() || table_len == 0 {
+        return vec![0u8; table_len];
+    }
+
+    // Table is stored LSD-first in base k (matches `decode_ca_rule_table` convention).
+    let mut table = vec![0u8; table_len];
+    for entry in table.iter_mut() {
+        *entry = div_decimal_vec(&mut decimal, k_usize as u64) as u8;
+    }
     table
 }
 
@@ -1351,6 +1454,126 @@ mod tests {
         rules.dedup();
         // 63 unique rules out of 64 indices (1 collision)
         assert_eq!(rules.len(), 63, "expected 63 unique FSM rules for (2,2)");
+    }
+
+    // ── decode_fsm_from_str: bigint-safe decoding ────────────────────────
+
+    #[test]
+    fn fsm_decode_from_str_matches_u64_for_small_space() {
+        for id in 0..64u64 {
+            let via_u64 = decode_fsm(id, 2, 2);
+            let via_str = decode_fsm_from_str(&id.to_string(), 2, 2);
+            assert_eq!(via_str, via_u64, "id {} mismatch", id);
+        }
+    }
+
+    #[test]
+    fn fsm_decode_from_str_fast_path_at_u64_max() {
+        // u64::MAX itself parses as u64, so both paths go through decode_fsm.
+        let id_str = u64::MAX.to_string();
+        let via_str = decode_fsm_from_str(&id_str, 9, 2);
+        let via_u64 = decode_fsm(u64::MAX, 9, 2);
+        assert_eq!(via_str, via_u64);
+    }
+
+    #[test]
+    fn fsm_decode_from_str_big_id_is_not_fsm_zero() {
+        // 49513043775795713316 > u64::MAX. The previous
+        // `id.parse::<u64>().unwrap_or(0)` path silently decoded this as FSM #0.
+        let big = "49513043775795713316";
+        assert!(big.parse::<u64>().is_err(), "precondition: overflows u64");
+        let big_decoded = decode_fsm_from_str(big, 9, 2);
+        let zero_decoded = decode_fsm(0, 9, 2);
+        assert_ne!(big_decoded, zero_decoded,
+            "big id must not collapse to FSM #0 (old bug)");
+    }
+
+    #[test]
+    fn fsm_decode_from_str_big_id_respects_ranges() {
+        for id in &[
+            "49513043775795713316",
+            "20000000000000000000",
+            "76848453272063549951",
+        ] {
+            let (outputs, transitions) = decode_fsm_from_str(id, 9, 2);
+            assert_eq!(outputs.len(), 9);
+            assert_eq!(transitions.len(), 18);
+            for &o in &outputs {
+                assert!(o < 2, "output out of range for id {}: {}", id, o);
+            }
+            for &t in &transitions {
+                assert!(t < 9, "transition out of range for id {}: {}", id, t);
+            }
+        }
+    }
+
+    #[test]
+    fn fsm_decode_from_str_matches_u128_reference_above_u64() {
+        // For index > u64::MAX, the encoding is just (idx-1) = tc*k^s + oc with
+        // positive idx-1 — no signed-abs edge case. A plain u128 implementation
+        // is a trustworthy reference in that regime.
+        fn reference_u128(index: u128, states: usize, actions: usize) -> (Vec<u8>, Vec<usize>) {
+            let n = states * actions;
+            let action_block = (actions as u128).pow(states as u32);
+            let mut tc = (index - 1) / action_block;
+            let mut oc = (index - 1) % action_block;
+
+            let mut next_digits = vec![0usize; n];
+            for i in (0..n).rev() {
+                next_digits[i] = (tc % states as u128) as usize;
+                tc /= states as u128;
+            }
+            let mut output_digits = vec![0usize; states];
+            for i in (0..states).rev() {
+                output_digits[i] = (oc % actions as u128) as usize;
+                oc /= actions as u128;
+            }
+
+            let outputs: Vec<u8> = output_digits.into_iter().map(|d| d as u8).collect();
+            let mut transitions = vec![0usize; n];
+            for state_idx in 0..states {
+                for input_idx in 0..actions {
+                    let flat_idx = state_idx * actions + input_idx;
+                    transitions[flat_idx] = next_digits[flat_idx].min(states - 1);
+                }
+            }
+            (outputs, transitions)
+        }
+
+        let u64_max = u64::MAX as u128;
+        for offset in [1u128, 2, 100, 1_000_000, 49_513_043_775_795_713_316u128 - u64_max] {
+            let index = u64_max + offset;
+            let id_str = index.to_string();
+            let via_str = decode_fsm_from_str(&id_str, 9, 2);
+            let via_ref = reference_u128(index, 9, 2);
+            assert_eq!(via_str, via_ref, "mismatch for id {}", id_str);
+        }
+    }
+
+    #[test]
+    fn fsm_runner_big_id_does_not_behave_as_fsm_zero() {
+        // End-to-end: StrategyRunner with a big-id FSM must diverge from
+        // StrategyRunner with FSM #0 during play. Regression guard for the
+        // IteratedGame overflow bug.
+        let spec_big = StrategySpec::Fsm {
+            id: "49513043775795713316".to_string(),
+            s: 9, k: 2, num_actions: 2,
+        };
+        let spec_zero = StrategySpec::Fsm {
+            id: "0".to_string(),
+            s: 9, k: 2, num_actions: 2,
+        };
+        let mut big = StrategyRunner::new(&spec_big);
+        let mut zero = StrategyRunner::new(&spec_zero);
+        let mut opp_big = StrategyRunner::new(&StrategySpec::Fsm {
+            id: "0".to_string(), s: 1, k: 2, num_actions: 2,
+        });
+        let mut opp_zero = StrategyRunner::new(&StrategySpec::Fsm {
+            id: "0".to_string(), s: 1, k: 2, num_actions: 2,
+        });
+        let (hist_big, _) = play_game_with_history_sentinel(&mut big, &mut opp_big, 20, &[]);
+        let (hist_zero, _) = play_game_with_history_sentinel(&mut zero, &mut opp_zero, 20, &[]);
+        assert_ne!(hist_big, hist_zero, "big-id FSM must not behave as FSM #0");
     }
 
     #[test]
