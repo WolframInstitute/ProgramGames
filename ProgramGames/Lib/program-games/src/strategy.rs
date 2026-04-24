@@ -1004,18 +1004,39 @@ pub fn behavior_trace_signature(raw: &RawFsm, steps: usize) -> Vec<u16> {
 
 
 
-fn insert_min_index(map: &mut HashMap<Vec<u16>, u64>, key: Vec<u16>, idx: u64) {
-    if let Some(existing) = map.get_mut(&key) {
-        *existing = (*existing).min(idx);
-    } else {
-        map.insert(key, idx);
-    }
+/// splitmix64 finalizer. Cheap, portable, good avalanche.
+/// Same primitive is used in the MSL GPU kernels so CPU and GPU hashes agree.
+#[inline]
+pub fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
 }
 
-fn merge_min_index_maps(left: &mut HashMap<Vec<u16>, u64>, right: HashMap<Vec<u16>, u64>) {
-    for (key, idx) in right {
-        insert_min_index(left, key, idx);
+/// 128-bit hash of a u16 slice. Two parallel splitmix64 streams with disjoint
+/// seeds give effectively independent 64-bit halves. Used to key both the
+/// structural canonicalization map (Phase 1) and the behavioral trace map
+/// (Phase 2) in `fsm_classify_two_step`. Portable to MSL (see gpu.rs).
+///
+/// Collision probability at 10^9 distinct inputs ≈ 10^-20 — negligible.
+pub fn hash_u16_slice_128(data: &[u16]) -> u128 {
+    // Seeds: sqrt(5)/2 and sqrt(2)/2 scaled to u64 (Knuth-style).
+    let mut lo: u64 = 0x9E3779B97F4A7C15 ^ (data.len() as u64);
+    let mut hi: u64 = 0x6A09E667F3BCC908 ^ (data.len() as u64);
+    lo = splitmix64(lo);
+    hi = splitmix64(hi);
+    for &v in data {
+        lo = splitmix64(lo ^ (v as u64));
+        hi = splitmix64(hi ^ ((v as u64).wrapping_mul(0x9E3779B97F4A7C15)));
     }
+    ((hi as u128) << 64) | (lo as u128)
+}
+
+/// Deprecated name kept for any external callers; forwards to the new hash.
+#[inline]
+pub fn hash_trace_128(trace: &[u16]) -> u128 {
+    hash_u16_slice_128(trace)
 }
 
 /// Two-step FSM classification result.
@@ -1034,18 +1055,85 @@ pub struct FsmClassification {
     pub sampled_rules: usize,
 }
 
+/// CPU Phase 2: behavioral trace hashing + grouping by hash.
+/// Used directly when `use_gpu=false`, and as the GPU fallback on any error.
+fn trace_hash_cpu(
+    canonical_reps: &[u64],
+    states: usize,
+    actions: usize,
+    trace_steps: usize,
+) -> Result<HashMap<u128, Vec<u64>>, String> {
+    canonical_reps
+        .par_iter()
+        .try_fold(HashMap::new, |mut local: HashMap<u128, Vec<u64>>, &idx| {
+            let raw = decode_fsm_raw(idx, states, actions)?;
+            let trace = behavior_trace_signature(&raw, trace_steps);
+            let key = hash_u16_slice_128(&trace);
+            local.entry(key).or_default().push(idx);
+            Ok::<_, String>(local)
+        })
+        .try_reduce(HashMap::new, |mut left, right| {
+            for (key, mut members) in right {
+                left.entry(key).or_default().append(&mut members);
+            }
+            Ok::<_, String>(left)
+        })
+}
+
+/// CPU Phase 1: structural canonicalization + min-index dedup.
+/// Used directly on the sample path, and as the GPU fallback on exhaustive runs.
+fn canonicalize_cpu(
+    candidates: &[u64],
+    states: usize,
+    actions: usize,
+    full_states_only: bool,
+) -> Result<HashMap<u128, u64>, String> {
+    candidates
+        .par_iter()
+        .try_fold(HashMap::new, |mut local: HashMap<u128, u64>, &idx| {
+            let raw = decode_fsm_raw(idx, states, actions)?;
+            let canonical = canonicalize_raw_fsm(&raw, 0);
+            if full_states_only && canonical.states() != states {
+                return Ok::<_, String>(local);
+            }
+            let key_bytes = raw_fsm_key(&canonical);
+            let key = hash_u16_slice_128(&key_bytes);
+            local
+                .entry(key)
+                .and_modify(|existing| *existing = (*existing).min(idx))
+                .or_insert(idx);
+            Ok::<_, String>(local)
+        })
+        .try_reduce(HashMap::new, |mut left, right| {
+            for (key, idx) in right {
+                left.entry(key)
+                    .and_modify(|existing| *existing = (*existing).min(idx))
+                    .or_insert(idx);
+            }
+            Ok::<_, String>(left)
+        })
+}
+
 /// Perform two-step FSM classification:
 /// 1. Canonicalize (BFS-reorder + structural dedup) -> canonical representatives
 /// 2. Behavioral grouping (12-step trace) -> unique behavior groups
 ///
 /// `states`/`actions` define the FSM space.
 /// If `sample > 0`, randomly sample that many indices; otherwise exhaustive.
+/// If `full_states_only` is true, FSMs whose BFS from the start state does not
+/// reach all `states` are discarded before behavioral grouping. This matches the
+/// WL `Select[..., VertexCount[FSMGraph[#]] == s &]` filter used to drop FSMs
+/// with dead states.
+/// If `use_gpu` is true and Metal is available, Phase 1 runs on GPU. Falls back
+/// to the Rayon CPU path on any GPU error. No effect on non-macOS builds.
 pub fn fsm_classify_two_step(
     states: usize,
     actions: usize,
     sample: usize,
     trace_steps: usize,
     seed: u64,
+    full_states_only: bool,
+    use_gpu: bool,
 ) -> Result<FsmClassification, String> {
     let total_rules = fsm_count(states, actions)
         .ok_or_else(|| "fsm space overflow".to_string())?;
@@ -1091,41 +1179,74 @@ pub fn fsm_classify_two_step(
     };
 
     let sampled_rules = candidates.len();
+    let is_exhaustive = sample == 0;
 
-    // Step 1: Canonicalize each FSM index -> structural key, keep min-index per key
-    let canonical_by_key = candidates
-        .par_iter()
-        .try_fold(HashMap::new, |mut local: HashMap<Vec<u16>, u64>, &idx| {
-            let raw = decode_fsm_raw(idx, states, actions)?;
-            let canonical = canonicalize_raw_fsm(&raw, 0);
-            let key = raw_fsm_key(&canonical);
-            insert_min_index(&mut local, key, idx);
-            Ok::<_, String>(local)
-        })
-        .try_reduce(HashMap::new, |mut left, right| {
-            merge_min_index_maps(&mut left, right);
-            Ok::<_, String>(left)
-        })?;
+    // Step 1: Canonicalize each FSM index -> structural key, keep min-index per key.
+    // If full_states_only is set, skip FSMs that don't reach all states from the
+    // start state (matching WL's VertexCount[FSMGraph[#]] == s filter).
+    //
+    // The structural key is hashed to u128 so the map stays compact (16 B per key)
+    // and matches the GPU path's output format. Collision probability is < 10^-20
+    // at 10^9 entries.
+    //
+    // GPU path is only used for exhaustive enumeration of the full index space —
+    // samples stay on CPU since the sample set might not be a contiguous range.
+    let canonical_by_key: HashMap<u128, u64> = if use_gpu && is_exhaustive {
+        match crate::gpu::run_fsm_canonicalize_gpu(
+            total_rules as u64,
+            states as u32,
+            actions as u32,
+            full_states_only,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "[fsm_classify] GPU Phase 1 unavailable ({}); falling back to CPU.",
+                    e
+                );
+                canonicalize_cpu(&candidates, states, actions, full_states_only)?
+            }
+        }
+    } else {
+        canonicalize_cpu(&candidates, states, actions, full_states_only)?
+    };
 
     let canonical_count = canonical_by_key.len();
     let mut canonical_reps: Vec<u64> = canonical_by_key.into_values().collect();
     canonical_reps.sort_unstable();
 
-    // Step 2: For each canonical representative, compute behavioral trace -> group by behavior
-    let behavior_by_key = canonical_reps
-        .par_iter()
-        .try_fold(HashMap::new, |mut local: HashMap<Vec<u16>, Vec<u64>>, &idx| {
-            let raw = decode_fsm_raw(idx, states, actions)?;
-            let trace = behavior_trace_signature(&raw, trace_steps);
-            local.entry(trace).or_default().push(idx);
-            Ok::<_, String>(local)
-        })
-        .try_reduce(HashMap::new, |mut left, right| {
-            for (key, mut members) in right {
-                left.entry(key).or_default().append(&mut members);
+    // Step 2: For each canonical representative, compute behavioral trace -> group by behavior.
+    //
+    // Key is a 128-bit splitmix-based hash of the depth-12 trace. The CPU and
+    // GPU paths produce byte-identical hashes (same splitmix64 primitive), so
+    // behavior groups match either way. Birthday collision at 10^9 entries is
+    // < 10^-20, negligible for problem sizes we care about.
+    let behavior_by_key: HashMap<u128, Vec<u64>> = if use_gpu {
+        match crate::gpu::run_fsm_trace_hash_gpu(
+            &canonical_reps,
+            states as u32,
+            actions as u32,
+            trace_steps as u32,
+        ) {
+            Ok(hashes) => {
+                let mut map: HashMap<u128, Vec<u64>> =
+                    HashMap::with_capacity(canonical_reps.len());
+                for (&idx, &key) in canonical_reps.iter().zip(hashes.iter()) {
+                    map.entry(key).or_default().push(idx);
+                }
+                map
             }
-            Ok::<_, String>(left)
-        })?;
+            Err(e) => {
+                eprintln!(
+                    "[fsm_classify] GPU Phase 2 unavailable ({}); falling back to CPU.",
+                    e
+                );
+                trace_hash_cpu(&canonical_reps, states, actions, trace_steps)?
+            }
+        }
+    } else {
+        trace_hash_cpu(&canonical_reps, states, actions, trace_steps)?
+    };
 
     let mut groups: Vec<Vec<u64>> = behavior_by_key.into_values().collect();
     for group in &mut groups {
@@ -2000,5 +2121,191 @@ mod tests {
     fn checked_pow_basic() {
         assert_eq!(checked_pow_u128(2, 10), Some(1024));
         assert_eq!(checked_pow_u128(3, 0), Some(1));
+    }
+
+    // ── FSM classify: full-states-only filter matches WL $FSMUnique ──────
+    //
+    // Mirrors the WL pipeline used in new Code-02.nb:
+    //   tups = Tuples[{1, 0}, 12];
+    //   Select[CanonicalFiniteStateMachineIndices[s, k],
+    //     VertexCount[FSMGraph[{#, s, k}]] == s &]  (* drop FSMs w/ dead states *)
+    //   GroupBy[..., Last -> First]
+    //   $FSMUnique = First /@ groups
+    //
+    // Rust equivalent: fsm_classify_two_step(s, k, 0, 12, _, full_states_only=true)
+    // then take `representatives`.
+
+    #[test]
+    fn fsm_unique_22_matches_wl() {
+        let expected: Vec<u64> = vec![
+            17, 18, 19, 20, 22, 23, 26, 27, 30, 31, 34, 35, 38, 39, 46, 47, 50, 51,
+            54, 55, 58, 59,
+        ];
+        let cls = fsm_classify_two_step(2, 2, 0, 12, 42, true, false).unwrap();
+        assert_eq!(
+            cls.representatives, expected,
+            "FSM (2,2) classification with full_states_only should match WL $FSMUnique22"
+        );
+    }
+
+    // s=4 exhaustive classification count (matches cached $FSMUnique42 from
+    // new Code-02.nb, length 51924). ~3s, small memory — fine to run by default.
+    #[test]
+    fn fsm_unique_42_count_matches_wl() {
+        let cls = fsm_classify_two_step(4, 2, 0, 12, 42, true, false).unwrap();
+        assert_eq!(cls.canonical_count, 83968, "canonical count for (4,2)");
+        assert_eq!(
+            cls.unique_behaviors, 51924,
+            "unique count for (4,2) should match WL $FSMUnique42"
+        );
+    }
+
+    // s=5 exhaustive: ~3 min on ~12 cores, ~6 GB peak RSS. Run with:
+    //   cargo test --release --no-default-features fsm_unique_52 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fsm_unique_52_count() {
+        let cls = fsm_classify_two_step(5, 2, 0, 12, 42, true, false).unwrap();
+        assert_eq!(cls.canonical_count, 5_141_600, "canonical count for (5,2)");
+        assert_eq!(
+            cls.unique_behaviors, 3_415_990,
+            "unique count for (5,2) — first exhaustive ground truth"
+        );
+    }
+
+    // GPU parity: same representatives as CPU for small cases. Only runs on
+    // macOS with the `metal` feature; skipped elsewhere.
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn fsm_unique_22_matches_wl_gpu() {
+        let expected: Vec<u64> = vec![
+            17, 18, 19, 20, 22, 23, 26, 27, 30, 31, 34, 35, 38, 39, 46, 47, 50, 51,
+            54, 55, 58, 59,
+        ];
+        let cls = fsm_classify_two_step(2, 2, 0, 12, 42, true, true).unwrap();
+        assert_eq!(cls.representatives, expected,
+            "GPU (2,2) representatives must match WL $FSMUnique22");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn fsm_unique_32_count_matches_cpu_gpu() {
+        let cpu = fsm_classify_two_step(3, 2, 0, 12, 42, true, false).unwrap();
+        let gpu = fsm_classify_two_step(3, 2, 0, 12, 42, true, true).unwrap();
+        assert_eq!(gpu.canonical_count, cpu.canonical_count);
+        assert_eq!(gpu.unique_behaviors, cpu.unique_behaviors);
+        assert_eq!(gpu.representatives, cpu.representatives);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn fsm_unique_42_count_matches_cpu_gpu() {
+        let cpu = fsm_classify_two_step(4, 2, 0, 12, 42, true, false).unwrap();
+        let gpu = fsm_classify_two_step(4, 2, 0, 12, 42, true, true).unwrap();
+        assert_eq!(gpu.canonical_count, cpu.canonical_count,
+            "GPU canonical count (4,2) must equal CPU: {} vs {}",
+            gpu.canonical_count, cpu.canonical_count);
+        assert_eq!(gpu.unique_behaviors, 51924);
+        assert_eq!(gpu.representatives, cpu.representatives,
+            "GPU representatives (4,2) must match CPU byte-for-byte");
+    }
+
+    #[test]
+    fn fsm_unique_32_matches_wl() {
+        // Full 956-element list from new Code-02.nb's $FSMUnique32.
+        let expected: Vec<u64> = vec![
+            793, 794, 795, 796, 797, 798, 799, 800, 802, 803, 804, 805, 806, 807,
+            810, 811, 814, 815, 818, 819, 820, 821, 822, 823, 826, 827, 828, 829,
+            830, 831, 834, 835, 836, 837, 838, 839, 842, 843, 844, 845, 846, 847,
+            850, 852, 853, 855, 858, 859, 860, 861, 862, 863, 1010, 1011, 1012,
+            1013, 1014, 1015, 1018, 1019, 1020, 1021, 1022, 1023, 1026, 1027, 1028,
+            1029, 1030, 1031, 1034, 1035, 1036, 1037, 1038, 1039, 1042, 1043, 1044,
+            1045, 1046, 1047, 1050, 1051, 1054, 1055, 1058, 1059, 1060, 1061, 1062,
+            1063, 1066, 1071, 1074, 1075, 1078, 1079, 1082, 1083, 1084, 1085, 1086,
+            1087, 1090, 1092, 1093, 1095, 1098, 1099, 1100, 1101, 1102, 1103, 1106,
+            1107, 1110, 1111, 1114, 1115, 1116, 1117, 1118, 1119, 1122, 1123, 1124,
+            1125, 1126, 1127, 1130, 1131, 1134, 1135, 1138, 1140, 1141, 1143, 1146,
+            1147, 1148, 1149, 1150, 1151, 1154, 1155, 1156, 1157, 1158, 1159, 1162,
+            1164, 1165, 1167, 1170, 1171, 1172, 1173, 1174, 1175, 1178, 1179, 1180,
+            1181, 1182, 1183, 1186, 1187, 1190, 1191, 1194, 1195, 1198, 1199, 1202,
+            1203, 1204, 1205, 1206, 1207, 1210, 1215, 1218, 1219, 1222, 1223, 1226,
+            1227, 1228, 1229, 1230, 1231, 1234, 1236, 1237, 1239, 1242, 1243, 1244,
+            1245, 1246, 1247, 1250, 1251, 1252, 1253, 1254, 1255, 1258, 1259, 1262,
+            1263, 1266, 1267, 1270, 1271, 1274, 1275, 1276, 1277, 1278, 1279, 1282,
+            1287, 1290, 1291, 1294, 1295, 2090, 2091, 2092, 2093, 2094, 2095, 2098,
+            2099, 2100, 2101, 2102, 2103, 2106, 2107, 2110, 2111, 2114, 2115, 2116,
+            2117, 2118, 2119, 2122, 2123, 2124, 2125, 2126, 2127, 2130, 2132, 2133,
+            2135, 2138, 2139, 2140, 2141, 2142, 2143, 2146, 2147, 2148, 2149, 2150,
+            2151, 2154, 2155, 2156, 2157, 2158, 2159, 2306, 2307, 2308, 2309, 2310,
+            2311, 2314, 2315, 2316, 2317, 2318, 2319, 2322, 2323, 2324, 2325, 2326,
+            2327, 2330, 2332, 2333, 2335, 2338, 2339, 2340, 2341, 2342, 2343, 2346,
+            2351, 2354, 2355, 2356, 2357, 2358, 2359, 2362, 2363, 2366, 2367, 2370,
+            2371, 2374, 2375, 2378, 2379, 2380, 2381, 2382, 2383, 2386, 2387, 2388,
+            2389, 2390, 2391, 2394, 2395, 2396, 2397, 2398, 2399, 2402, 2407, 2410,
+            2411, 2412, 2413, 2414, 2415, 2418, 2420, 2421, 2423, 2426, 2427, 2430,
+            2431, 2434, 2435, 2436, 2437, 2438, 2439, 2442, 2443, 2444, 2445, 2446,
+            2447, 2450, 2451, 2452, 2453, 2454, 2455, 2458, 2459, 2460, 2461, 2462,
+            2463, 2466, 2467, 2468, 2469, 2470, 2471, 2474, 2476, 2477, 2479, 2482,
+            2483, 2486, 2487, 2490, 2495, 2498, 2499, 2500, 2501, 2502, 2503, 2506,
+            2507, 2510, 2511, 2514, 2515, 2518, 2519, 2522, 2523, 2524, 2525, 2526,
+            2527, 2530, 2531, 2532, 2533, 2534, 2535, 2538, 2539, 2540, 2541, 2542,
+            2543, 2546, 2548, 2549, 2551, 2554, 2555, 2558, 2559, 2562, 2567, 2570,
+            2571, 2572, 2573, 2574, 2575, 2578, 2579, 2582, 2583, 2586, 2587, 2590,
+            2591, 2738, 2739, 2740, 2741, 2742, 2743, 2746, 2747, 2748, 2749, 2750,
+            2751, 2754, 2755, 2758, 2759, 2762, 2763, 2764, 2765, 2766, 2767, 2770,
+            2771, 2772, 2773, 2774, 2775, 2778, 2779, 2780, 2781, 2782, 2783, 2786,
+            2787, 2788, 2789, 2790, 2791, 2794, 2795, 2796, 2797, 2798, 2799, 2802,
+            2803, 2804, 2805, 2806, 2807, 2954, 2955, 2956, 2957, 2958, 2959, 2962,
+            2963, 2964, 2965, 2966, 2967, 2970, 2971, 2972, 2973, 2974, 2975, 2978,
+            2979, 2980, 2981, 2982, 2983, 2986, 2987, 2994, 2995, 3002, 3003, 3004,
+            3005, 3006, 3007, 3010, 3011, 3018, 3019, 3026, 3027, 3028, 3029, 3030,
+            3031, 3034, 3035, 3036, 3037, 3038, 3039, 3042, 3043, 3044, 3045, 3046,
+            3047, 3050, 3051, 3054, 3055, 3066, 3067, 3068, 3069, 3070, 3071, 3074,
+            3075, 3078, 3079, 3082, 3083, 3084, 3085, 3086, 3087, 3090, 3091, 3092,
+            3093, 3094, 3095, 3098, 3099, 3100, 3101, 3102, 3103, 3106, 3107, 3108,
+            3109, 3110, 3111, 3114, 3115, 3116, 3117, 3118, 3119, 3122, 3123, 3124,
+            3125, 3126, 3127, 3138, 3139, 3146, 3147, 3148, 3149, 3150, 3151, 3154,
+            3155, 3162, 3163, 3170, 3171, 3172, 3173, 3174, 3175, 3178, 3179, 3180,
+            3181, 3182, 3183, 3186, 3187, 3188, 3189, 3190, 3191, 3194, 3195, 3196,
+            3197, 3198, 3199, 3210, 3211, 3218, 3219, 3220, 3221, 3222, 3223, 3226,
+            3227, 3234, 3235, 3242, 3243, 3246, 3247, 3250, 3251, 3252, 3253, 3254,
+            3255, 3258, 3259, 3260, 3261, 3262, 3263, 3266, 3268, 3269, 3271, 3274,
+            3275, 3276, 3277, 3278, 3279, 3290, 3291, 3292, 3293, 3294, 3295, 3298,
+            3299, 3300, 3301, 3302, 3303, 3306, 3307, 3308, 3309, 3310, 3311, 3314,
+            3315, 3316, 3317, 3318, 3319, 3322, 3323, 3326, 3327, 3330, 3331, 3334,
+            3335, 3338, 3340, 3341, 3343, 3346, 3347, 3348, 3349, 3350, 3351, 3362,
+            3363, 3364, 3365, 3366, 3367, 3370, 3371, 3372, 3373, 3374, 3375, 3378,
+            3379, 3380, 3381, 3382, 3383, 3387, 3388, 3389, 3390, 3395, 3398, 3403,
+            3406, 3412, 3413, 3419, 3420, 3421, 3422, 3435, 3436, 3437, 3438, 3443,
+            3444, 3445, 3446, 3451, 3452, 3453, 3454, 3458, 3459, 3460, 3461, 3462,
+            3463, 3466, 3467, 3468, 3469, 3470, 3471, 3474, 3475, 3476, 3477, 3478,
+            3479, 3482, 3487, 3490, 3491, 3492, 3493, 3494, 3495, 3506, 3507, 3510,
+            3511, 3514, 3515, 3516, 3517, 3518, 3519, 3522, 3523, 3524, 3525, 3526,
+            3527, 3530, 3531, 3532, 3533, 3534, 3535, 3538, 3539, 3540, 3541, 3542,
+            3543, 3546, 3547, 3548, 3549, 3550, 3551, 3554, 3556, 3557, 3559, 3562,
+            3563, 3578, 3579, 3580, 3581, 3582, 3583, 3586, 3587, 3594, 3595, 3674,
+            3675, 3676, 3677, 3678, 3679, 3682, 3683, 3684, 3685, 3686, 3687, 3690,
+            3691, 3692, 3693, 3694, 3695, 3698, 3703, 3706, 3707, 3708, 3709, 3710,
+            3711, 3722, 3723, 3726, 3727, 3730, 3731, 3732, 3733, 3734, 3735, 3738,
+            3739, 3740, 3741, 3742, 3743, 3746, 3747, 3748, 3749, 3750, 3751, 3754,
+            3755, 3756, 3757, 3758, 3759, 3762, 3763, 3764, 3765, 3766, 3767, 3770,
+            3772, 3773, 3775, 3778, 3779, 3794, 3795, 3796, 3797, 3798, 3799, 3802,
+            3803, 3810, 3811, 3818, 3819, 3820, 3821, 3822, 3823, 3826, 3827, 3828,
+            3829, 3830, 3831, 3834, 3835, 3836, 3837, 3838, 3839, 3842, 3844, 3845,
+            3847, 3850, 3851, 3866, 3867, 3868, 3869, 3870, 3871, 3874, 3875, 3882,
+            3883,
+        ];
+        assert_eq!(expected.len(), 956, "expected list length sanity");
+
+        let cls = fsm_classify_two_step(3, 2, 0, 12, 42, true, false).unwrap();
+        assert_eq!(
+            cls.representatives.len(),
+            expected.len(),
+            "FSM (3,2) representative count mismatch"
+        );
+        assert_eq!(
+            cls.representatives, expected,
+            "FSM (3,2) classification with full_states_only should match WL $FSMUnique32"
+        );
     }
 }

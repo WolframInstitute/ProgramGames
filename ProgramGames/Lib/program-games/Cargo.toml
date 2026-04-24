@@ -9,7 +9,10 @@ metal = ["dep:metal"]
 
 [lib]
 name = "program_games"
-crate-type = ["lib", "cdylib"]
+# Only cdylib: the runtime shared library Wolfram's CargoLoad dlopens.
+# Dropping "lib" skips the Rust-only .rlib archive (~7 MB per target), which no
+# other crate depends on in a paclet context.
+crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [[bin]]

@@ -64,6 +64,14 @@ jobs:
           chmod +x build_macos_targets.sh
           ./build_macos_targets.sh
 
+      - name: Run Classifier Regression Tests
+        # Pins the known-good FSM classification output ($FSMUnique22, $FSMUnique32,
+        # $FSMUnique42, plus CPU↔GPU parity on s=2..4) so a broken classifier or
+        # GPU kernel can't silently make it into a release.
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --release -p program-games fsm_unique
+
       - name: Upload macOS Binaries
         uses: actions/upload-artifact@v4
         with:

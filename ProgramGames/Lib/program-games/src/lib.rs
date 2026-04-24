@@ -1364,6 +1364,11 @@ fn ca_classify_group_signatures_indexed(
 /// `states`/`symbols` define the FSM space; `depth` controls the behavioral
 /// trace length for grouping (higher = finer distinction between FSMs);
 /// `sample=0` means exhaustive, `sample>0` means random sample of that size.
+/// `full_states_only` (nonzero = true) drops FSMs whose BFS from state 0 does
+/// not reach all `states` states — matches the WL notebook's
+/// `Select[..., VertexCount[FSMGraph[{#, s, k}]] == s &]` filter.
+/// `use_gpu` (nonzero = true) routes Phases 1 and 2 through Metal when
+/// available (exhaustive enumeration only); falls back to CPU on any GPU error.
 #[wll::export]
 pub fn fsm_classify_wl(
     states: i64,
@@ -1371,13 +1376,17 @@ pub fn fsm_classify_wl(
     depth: i64,
     sample: i64,
     seed: i64,
+    full_states_only: i64,
+    use_gpu: i64,
 ) -> String {
     let states = states as usize;
     let symbols = symbols as usize;
     let sample = if sample > 0 { sample as usize } else { 0 };
     let trace_steps = if depth > 0 { depth as usize } else { 12 };
+    let full_states_only = full_states_only != 0;
+    let use_gpu = use_gpu != 0;
 
-    match strategy::fsm_classify_two_step(states, symbols, sample, trace_steps, seed as u64) {
+    match strategy::fsm_classify_two_step(states, symbols, sample, trace_steps, seed as u64, full_states_only, use_gpu) {
         Ok(result) => {
             let group_entries: Vec<serde_json::Value> = result
                 .groups
@@ -2787,7 +2796,7 @@ mod tests {
         eprintln!("  {}", "-".repeat(62));
 
         for (s, k) in [(1, 2), (2, 2), (3, 2), (4, 2)] {
-            let result_str = fsm_classify_wl(s, k as i64, 4, 0, 42);
+            let result_str = fsm_classify_wl(s, k as i64, 4, 0, 42, 0, 0);
             let parsed: serde_json::Value = serde_json::from_str(&result_str).unwrap();
             let total = parsed["total_rules"].as_u64().unwrap();
             let canonical = parsed["canonical_count"].as_u64().unwrap();

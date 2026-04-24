@@ -2225,6 +2225,450 @@ kernel void fsm_lz_complexity(
             )
         }
     }
+
+    // ── FSM Classification on Metal ────────────────────────────────────
+    //
+    // Phase 1: `fsm_canonicalize` kernel.
+    //   Thread i decodes FSM at (start_idx + i), BFS-canonicalizes from state 0,
+    //   writes (is_full_state, u128 canonical-key hash) per index. Host does
+    //   min-index dedup in a HashMap<u128, u64>.
+    //
+    // The hash on-device uses the same splitmix64 primitive as the CPU path
+    // (see strategy::hash_u16_slice_128), so GPU and CPU produce byte-identical
+    // u128 keys for the same canonical FSM.
+
+    pub const CLASSIFY_FSM_MAX_STATES: usize = 8;
+    pub const CLASSIFY_FSM_MAX_ACTIONS: usize = 4;
+
+    pub const CLASSIFY_FSM_MAX_TRACE_STEPS: usize = 16;
+
+    const FSM_CLASSIFY_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define FSM_MAX_STATES 8u
+#define FSM_MAX_ACTIONS 4u
+#define FSM_MAX_TRANS (FSM_MAX_STATES * FSM_MAX_ACTIONS)
+#define FSM_MAX_TRACE_STEPS 16u
+
+struct FsmCanonParams {
+    ulong start_idx;
+    uint count;
+    uint states;
+    uint actions;
+    uint full_states_only;
+    uint _pad;
+};
+
+struct FsmTraceHashParams {
+    uint count;
+    uint states;
+    uint actions;
+    uint trace_steps;
+    uint _pad[4];
+};
+
+// splitmix64 finalizer — matches Rust strategy::splitmix64 byte-for-byte.
+inline ulong sm64(ulong x) {
+    x = x + 0x9E3779B97F4A7C15UL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+    return x ^ (x >> 31);
+}
+
+// Shared FSM decode: fills transitions[s*k] and outputs[s] from idx.
+// Matches strategy::decode_fsm_raw including the idx=0 floor-div-rem edge case.
+inline void decode_fsm_local(
+    ulong idx,
+    uint s,
+    uint k,
+    thread uchar* transitions,
+    thread uchar* outputs)
+{
+    ulong action_block = 1UL;
+    for (uint i = 0; i < s; i++) action_block *= (ulong)k;
+
+    ulong transition_code, output_code;
+    if (idx == 0UL) {
+        transition_code = 1UL;
+        output_code = action_block - 1UL;
+    } else {
+        ulong tmp = idx - 1UL;
+        transition_code = tmp / action_block;
+        output_code = tmp % action_block;
+    }
+
+    uint trans_len = s * k;
+    ulong x = transition_code;
+    for (int i = (int)trans_len - 1; i >= 0; i--) {
+        if (s <= 1u) { transitions[i] = 0; }
+        else { transitions[i] = (uchar)(x % (ulong)s); x /= (ulong)s; }
+    }
+    for (uint i = 0; i < trans_len; i++) {
+        if ((uint)transitions[i] >= s) transitions[i] = (uchar)(s - 1u);
+    }
+
+    x = output_code;
+    for (int i = (int)s - 1; i >= 0; i--) {
+        if (k <= 1u) { outputs[i] = 0; }
+        else { outputs[i] = (uchar)(x % (ulong)k); x /= (ulong)k; }
+    }
+}
+
+kernel void fsm_canonicalize(
+    device ulong2* out_keys            [[buffer(0)]],
+    device uchar*  out_full            [[buffer(1)]],
+    constant FsmCanonParams& params    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.count) return;
+    ulong idx = params.start_idx + (ulong)gid;
+
+    uint s = params.states;
+    uint k = params.actions;
+
+    uchar transitions[FSM_MAX_TRANS];
+    uchar outputs[FSM_MAX_STATES];
+    decode_fsm_local(idx, s, k, transitions, outputs);
+
+    // BFS from state 0. state_map[orig] = 1 + new_id (0 means unseen).
+    uchar state_map[FSM_MAX_STATES];
+    uchar order[FSM_MAX_STATES];
+    for (uint i = 0; i < s; i++) state_map[i] = 0;
+    state_map[0] = 1;
+    order[0] = 0;
+    uint head = 0u;
+    uint tail = 1u;
+    uint next_id = 1u;
+    while (head < tail) {
+        uchar st = order[head++];
+        for (uint input = 0; input < k; input++) {
+            uchar nx = transitions[st * k + input];
+            if (state_map[nx] == 0) {
+                state_map[nx] = (uchar)(next_id + 1u);
+                order[tail++] = nx;
+                next_id++;
+            }
+        }
+    }
+    uint reached = tail;
+
+    uchar is_full = (reached == s) ? 1u : 0u;
+    out_full[gid] = is_full;
+
+    if (params.full_states_only != 0u && is_full == 0u) {
+        out_keys[gid] = ulong2(0UL, 0UL);
+        return;
+    }
+
+    // Build canonical key as a stream of u16 values and hash via two splitmix64
+    // lanes. Matches strategy::hash_u16_slice_128 exactly:
+    //   len = reached * (1 + k)
+    //   seed_lo = 0x9E37..5 ^ len, seed_hi = 0x6A09..8 ^ len, both sm64'd once
+    //   then per-value: lo = sm64(lo ^ v), hi = sm64(hi ^ (v * 0x9E37..5))
+    ulong key_len = (ulong)reached * (ulong)(1u + k);
+    ulong lo = 0x9E3779B97F4A7C15UL ^ key_len;
+    ulong hi = 0x6A09E667F3BCC908UL ^ key_len;
+    lo = sm64(lo);
+    hi = sm64(hi);
+
+    // Outputs in BFS order.
+    for (uint j = 0; j < reached; j++) {
+        ulong v = (ulong)outputs[order[j]];
+        lo = sm64(lo ^ v);
+        hi = sm64(hi ^ (v * 0x9E3779B97F4A7C15UL));
+    }
+    // Transitions in BFS order, renumbered.
+    for (uint j = 0; j < reached; j++) {
+        uchar st = order[j];
+        for (uint input = 0; input < k; input++) {
+            uchar orig_next = transitions[st * k + input];
+            // state_map[orig_next] >= 1 for any reachable state; non-reachable
+            // would be 0 but we only emit the key when reached == s, which means
+            // every orig_next we hit here is reachable too (transitively).
+            uchar renum = (uchar)(state_map[orig_next] - 1u);
+            ulong v = (ulong)renum;
+            lo = sm64(lo ^ v);
+            hi = sm64(hi ^ (v * 0x9E3779B97F4A7C15UL));
+        }
+    }
+
+    out_keys[gid] = ulong2(lo, hi);
+}
+
+// Phase 2 kernel: depth-`trace_steps` behavioral trace, hashed on the fly.
+// Matches strategy::behavior_trace_signature + hash_u16_slice_128 exactly:
+// iterates sequence_idx 0..k^steps, inverts base-k digits via (k-1-digit), runs
+// FSM from state 0, emits outputs[next] per transition, streams into two
+// splitmix64 lanes. Output is a u128 hash per input FSM.
+kernel void fsm_trace_hash(
+    device const ulong* indices            [[buffer(0)]],
+    device ulong2*      out_hashes         [[buffer(1)]],
+    constant FsmTraceHashParams& params    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.count) return;
+    ulong idx = indices[gid];
+    uint s = params.states;
+    uint k = params.actions;
+    uint steps = params.trace_steps;
+
+    uchar transitions[FSM_MAX_TRANS];
+    uchar outputs[FSM_MAX_STATES];
+    decode_fsm_local(idx, s, k, transitions, outputs);
+
+    // sequence_count = k^steps  (assumes steps <= FSM_MAX_TRACE_STEPS)
+    ulong sequence_count = 1UL;
+    for (uint i = 0; i < steps; i++) sequence_count *= (ulong)k;
+    ulong total_len = sequence_count * (ulong)steps;
+
+    ulong lo = 0x9E3779B97F4A7C15UL ^ total_len;
+    ulong hi = 0x6A09E667F3BCC908UL ^ total_len;
+    lo = sm64(lo);
+    hi = sm64(hi);
+
+    uchar digits[FSM_MAX_TRACE_STEPS];
+    for (ulong seq = 0UL; seq < sequence_count; seq++) {
+        ulong code = seq;
+        for (int pos = (int)steps - 1; pos >= 0; pos--) {
+            uint digit = (uint)(code % (ulong)k);
+            code /= (ulong)k;
+            digits[pos] = (uchar)((k - 1u) - digit); // invert → matches Tuples[{1,0},n]
+        }
+
+        uint state = 0u;
+        for (uint pos = 0; pos < steps; pos++) {
+            uint input = (uint)digits[pos];
+            uint next = (uint)transitions[state * k + input];
+            if (next >= s) next = s - 1u;
+            ulong v = (ulong)outputs[next];
+            lo = sm64(lo ^ v);
+            hi = sm64(hi ^ (v * 0x9E3779B97F4A7C15UL));
+            state = next;
+        }
+    }
+
+    out_hashes[gid] = ulong2(lo, hi);
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct FsmCanonParams {
+        start_idx: u64,
+        count: u32,
+        states: u32,
+        actions: u32,
+        full_states_only: u32,
+        _pad: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct FsmTraceHashParams {
+        count: u32,
+        states: u32,
+        actions: u32,
+        trace_steps: u32,
+        _pad: [u32; 4],
+    }
+
+    pub struct MetalFsmClassifier {
+        device: Device,
+        queue: CommandQueue,
+        canon_pipeline: ComputePipelineState,
+        trace_pipeline: ComputePipelineState,
+    }
+
+    impl MetalFsmClassifier {
+        pub fn new() -> Result<Self, String> {
+            let device = Device::system_default().ok_or("Metal device unavailable")?;
+            let opts = CompileOptions::new();
+            let lib = device
+                .new_library_with_source(FSM_CLASSIFY_SHADER, &opts)
+                .map_err(|e| format!("Metal FSM classify shader compile: {e}"))?;
+            let canon_func = lib
+                .get_function("fsm_canonicalize", None)
+                .map_err(|e| format!("Metal fsm_canonicalize lookup: {e}"))?;
+            let canon_pipeline = device
+                .new_compute_pipeline_state_with_function(&canon_func)
+                .map_err(|e| format!("Metal fsm_canonicalize pipeline: {e}"))?;
+            let trace_func = lib
+                .get_function("fsm_trace_hash", None)
+                .map_err(|e| format!("Metal fsm_trace_hash lookup: {e}"))?;
+            let trace_pipeline = device
+                .new_compute_pipeline_state_with_function(&trace_func)
+                .map_err(|e| format!("Metal fsm_trace_hash pipeline: {e}"))?;
+            let queue = device.new_command_queue();
+            Ok(Self { device, queue, canon_pipeline, trace_pipeline })
+        }
+
+        /// Run the canonicalize kernel on [start_idx, start_idx + count) and
+        /// return (keys, full_flags) as parallel vectors of length `count`.
+        /// A key of `(0, 0)` paired with full=0 means "skipped" (not full-state
+        /// when full_states_only was set).
+        pub fn canonicalize_batch(
+            &self,
+            start_idx: u64,
+            count: u32,
+            states: u32,
+            actions: u32,
+            full_states_only: bool,
+        ) -> Result<(Vec<u128>, Vec<u8>), String> {
+            if count == 0 {
+                return Ok((vec![], vec![]));
+            }
+            if states as usize > CLASSIFY_FSM_MAX_STATES
+                || actions as usize > CLASSIFY_FSM_MAX_ACTIONS
+            {
+                return Err(format!(
+                    "GPU classifier compiled for max (s={}, k={}); got (s={}, k={})",
+                    CLASSIFY_FSM_MAX_STATES, CLASSIFY_FSM_MAX_ACTIONS, states, actions
+                ));
+            }
+
+            let params = FsmCanonParams {
+                start_idx,
+                count,
+                states,
+                actions,
+                full_states_only: if full_states_only { 1 } else { 0 },
+                _pad: 0,
+            };
+
+            let keys_bytes = (count as u64) * (size_of::<[u64; 2]>() as u64);
+            let full_bytes = count as u64;
+            let keys_buf = self
+                .device
+                .new_buffer(keys_bytes, MTLResourceOptions::StorageModeShared);
+            let full_buf = self
+                .device
+                .new_buffer(full_bytes, MTLResourceOptions::StorageModeShared);
+
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.canon_pipeline);
+            enc.set_buffer(0, Some(&keys_buf), 0);
+            enc.set_buffer(1, Some(&full_buf), 0);
+            enc.set_bytes(
+                2,
+                size_of::<FsmCanonParams>() as u64,
+                (&params as *const FsmCanonParams).cast(),
+            );
+
+            let width = self.canon_pipeline.thread_execution_width().max(1);
+            let tpg = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (count as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            enc.dispatch_thread_groups(groups, tpg);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let key_slice: &[[u64; 2]] = unsafe {
+                std::slice::from_raw_parts(
+                    keys_buf.contents() as *const [u64; 2],
+                    count as usize,
+                )
+            };
+            let full_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(full_buf.contents() as *const u8, count as usize)
+            };
+
+            let keys: Vec<u128> = key_slice
+                .iter()
+                .map(|pair| ((pair[1] as u128) << 64) | (pair[0] as u128))
+                .collect();
+            let flags = full_slice.to_vec();
+            Ok((keys, flags))
+        }
+
+        /// Compute a u128 depth-`trace_steps` behavioral-trace hash for each FSM
+        /// index in `indices`. Output is parallel to input (one u128 per idx).
+        /// Matches `strategy::behavior_trace_signature` + `hash_u16_slice_128`.
+        pub fn trace_hash_batch(
+            &self,
+            indices: &[u64],
+            states: u32,
+            actions: u32,
+            trace_steps: u32,
+        ) -> Result<Vec<u128>, String> {
+            if indices.is_empty() {
+                return Ok(vec![]);
+            }
+            if states as usize > CLASSIFY_FSM_MAX_STATES
+                || actions as usize > CLASSIFY_FSM_MAX_ACTIONS
+            {
+                return Err(format!(
+                    "GPU classifier compiled for max (s={}, k={}); got (s={}, k={})",
+                    CLASSIFY_FSM_MAX_STATES, CLASSIFY_FSM_MAX_ACTIONS, states, actions
+                ));
+            }
+            if trace_steps as usize > CLASSIFY_FSM_MAX_TRACE_STEPS {
+                return Err(format!(
+                    "GPU trace kernel supports up to {} steps; got {}",
+                    CLASSIFY_FSM_MAX_TRACE_STEPS, trace_steps
+                ));
+            }
+
+            let count = indices.len() as u32;
+            let params = FsmTraceHashParams {
+                count,
+                states,
+                actions,
+                trace_steps,
+                _pad: [0; 4],
+            };
+
+            let in_buf = self.device.new_buffer_with_data(
+                indices.as_ptr() as *const c_void,
+                (indices.len() * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let out_bytes = (count as u64) * (size_of::<[u64; 2]>() as u64);
+            let out_buf = self
+                .device
+                .new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
+
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.trace_pipeline);
+            enc.set_buffer(0, Some(&in_buf), 0);
+            enc.set_buffer(1, Some(&out_buf), 0);
+            enc.set_bytes(
+                2,
+                size_of::<FsmTraceHashParams>() as u64,
+                (&params as *const FsmTraceHashParams).cast(),
+            );
+
+            let width = self.trace_pipeline.thread_execution_width().max(1);
+            let tpg = MTLSize::new(width, 1, 1);
+            let groups = MTLSize::new(
+                (count as u64 + width - 1) / width,
+                1,
+                1,
+            );
+            enc.dispatch_thread_groups(groups, tpg);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let out_slice: &[[u64; 2]] = unsafe {
+                std::slice::from_raw_parts(
+                    out_buf.contents() as *const [u64; 2],
+                    count as usize,
+                )
+            };
+            let hashes: Vec<u128> = out_slice
+                .iter()
+                .map(|pair| ((pair[1] as u128) << 64) | (pair[0] as u128))
+                .collect();
+            Ok(hashes)
+        }
+    }
 }
 
 // Re-export
@@ -2456,6 +2900,103 @@ pub fn run_fsm_complexity_gpu(
     _rounds: u32,
     _num_actions: u32,
 ) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>), String> {
+    Err("Metal not available".to_string())
+}
+
+/// Run FSM Phase 1 canonicalization on GPU.
+///
+/// Enumerates every FSM index in `[0, total)` in batches sized to fit in a
+/// Metal buffer (`batch_size` indices × 17 B per index of output). Each batch
+/// produces (u128 canonical-key-hash, full-state-flag) per index. The host
+/// then merges all batch outputs into a `HashMap<u128, u64>` keyed by the
+/// canonical hash, tracking the minimum FSM index per key — identical output
+/// shape to the CPU path's Step 1.
+///
+/// Returns `Err` if Metal isn't available or the (states, actions) exceeds the
+/// classifier's compile-time caps (8 states × 4 actions).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn run_fsm_canonicalize_gpu(
+    total: u64,
+    states: u32,
+    actions: u32,
+    full_states_only: bool,
+) -> Result<std::collections::HashMap<u128, u64>, String> {
+    use std::collections::HashMap;
+
+    let gpu = metal_impl::MetalFsmClassifier::new()?;
+
+    // ~256 MB per batch of output (17 B × 16M indices). Tunable.
+    const BATCH: u64 = 1 << 24; // 16,777,216 indices / batch
+
+    let mut canonical_by_key: HashMap<u128, u64> = HashMap::new();
+
+    let mut start = 0u64;
+    while start < total {
+        let count = (total - start).min(BATCH) as u32;
+        let (keys, flags) =
+            gpu.canonicalize_batch(start, count, states, actions, full_states_only)?;
+        for i in 0..count as usize {
+            if full_states_only && flags[i] == 0 {
+                continue;
+            }
+            let key = keys[i];
+            let idx = start + i as u64;
+            canonical_by_key
+                .entry(key)
+                .and_modify(|existing| *existing = (*existing).min(idx))
+                .or_insert(idx);
+        }
+        start += count as u64;
+    }
+
+    Ok(canonical_by_key)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn run_fsm_canonicalize_gpu(
+    _total: u64,
+    _states: u32,
+    _actions: u32,
+    _full_states_only: bool,
+) -> Result<std::collections::HashMap<u128, u64>, String> {
+    Err("Metal not available".to_string())
+}
+
+/// Run FSM Phase 2 behavioral trace hashing on GPU.
+///
+/// Takes a sorted slice of canonical FSM indices, dispatches the kernel in
+/// batches that fit in GPU memory, and returns a parallel `Vec<u128>` of
+/// depth-`trace_steps` trace hashes. Caller groups by hash on CPU to form the
+/// final behavior classes.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn run_fsm_trace_hash_gpu(
+    indices: &[u64],
+    states: u32,
+    actions: u32,
+    trace_steps: u32,
+) -> Result<Vec<u128>, String> {
+    let gpu = metal_impl::MetalFsmClassifier::new()?;
+
+    // ~32 MB / batch (16 B × 2M indices). Each thread runs k^steps * steps
+    // transitions, so wall clock per batch is bounded regardless of batch size;
+    // this chunking is purely for buffer memory.
+    const BATCH: usize = 1 << 21;
+
+    let mut out = Vec::with_capacity(indices.len());
+    for chunk in indices.chunks(BATCH) {
+        let hashes = gpu.trace_hash_batch(chunk, states, actions, trace_steps)?;
+        out.extend_from_slice(&hashes);
+    }
+    Ok(out)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+pub fn run_fsm_trace_hash_gpu(
+    _indices: &[u64],
+    _states: u32,
+    _actions: u32,
+    _trace_steps: u32,
+) -> Result<Vec<u128>, String> {
     Err("Metal not available".to_string())
 }
 
