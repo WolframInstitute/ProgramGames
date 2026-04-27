@@ -19,8 +19,11 @@ PackageExport["ProgramGamesSetup"]
 
 PackageScope["$ProgramGamesPackageDirectory"]
 PackageScope["$ProgramGamesRequiredFunctionNames"]
+PackageScope["$ExternalEvaluatePacletURL"]
+PackageScope["$PacletExtensionsURL"]
 PackageScope["functions"]
 PackageScope["iCargoBuildAndLoad"]
+PackageScope["iEnsureCargoDeps"]
 PackageScope["iLoadFunctions"]
 PackageScope["iMissingFunctionNames"]
 PackageScope["TMSearchWL"]
@@ -72,7 +75,10 @@ $ProgramGamesRequiredFunctionNames = {
 	"rule_array_tournament_wl",
 	"iterated_game_wl",
 	"iterated_game_tournament_wl",
-	"iterated_game_cross_wl"
+	"iterated_game_cross_wl",
+	"fsm_evolve_single_wl",
+	"fsm_evolve_population_wl",
+	"fsm_evolve_coadapt_wl"
 };
 
 iMissingFunctionNames[funcs_Association] :=
@@ -90,15 +96,28 @@ TuringMachineMaxIndex[s_Integer, k_Integer] := (2 s k)^(s k) - 1
 (*Setup*)
 
 
+$ExternalEvaluatePacletURL = "https://www.wolframcloud.com/obj/nikm/ExternalEvaluate.paclet";
+$PacletExtensionsURL = "https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet";
+
+(* Install ExtensionCargo's runtime deps if they're missing.
+   ExtensionCargo imports ExternalEvaluateCommon`WXFRead/WXFWrite/MethodCaller
+   (provided by ExternalEvaluate.paclet, not by Wolfram Engine). On a fresh
+   Linux install where only PacletExtensions is installed, CargoLoad silently
+   fails to read manifests and the whole binary load chain falls through to
+   iCargoBuildAndLoad - which then needs Rust and rebuilds from source.
+   Installing both paclets up-front avoids that path. *)
+iEnsureCargoDeps[] := (
+	If[!PacletObjectQ[PacletObject["ExternalEvaluate"]],
+		PacletInstall[$ExternalEvaluatePacletURL]
+	];
+	If[!PacletObjectQ[PacletObject["PacletExtensions"]],
+		PacletInstall[$PacletExtensionsURL]
+	];
+)
+
 ProgramGamesSetup[] := (
-	PacletInstall[
-		"https://www.wolframcloud.com/obj/nikm/ExternalEvaluate.paclet",
-		ForceVersionInstall -> True
-	];
-	PacletInstall[
-		"https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet",
-		ForceVersionInstall -> True
-	];
+	PacletInstall[$ExternalEvaluatePacletURL, ForceVersionInstall -> True];
+	PacletInstall[$PacletExtensionsURL, ForceVersionInstall -> True];
 	Needs["ExtensionCargo`"];
 	SetEnvironment[
 		"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]
@@ -141,9 +160,7 @@ iCargoBuildAndLoad[paclet_] := Replace[
 
 iLoadFunctions[] := With[{paclet = PacletObject["WolframInstitute/ProgramGames"]},
 	(
-		If[!PacletObjectQ[PacletObject["PacletExtensions"]],
-			PacletInstall["https://www.wolframcloud.com/obj/nikm/PacletExtensions.paclet"]
-		];
+		iEnsureCargoDeps[];
 		Needs["ExtensionCargo`"];
 		SetEnvironment[
 			"PATH" -> Environment["PATH"] <> ":" <> FileNameJoin[{$HomeDirectory, ".cargo", "bin"}]

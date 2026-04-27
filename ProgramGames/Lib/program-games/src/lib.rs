@@ -4,6 +4,7 @@ use serde::Serialize;
 use wolfram_library_link as wll;
 wll::generate_loader!(rustlink_autodiscover);
 
+pub mod evolve;
 pub mod gpu;
 pub mod strategy;
 pub mod tournament;
@@ -2023,6 +2024,400 @@ pub fn fsm_complexity_wl(
         "gpu": used_gpu
     });
     serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+}
+
+// ── FSM evolution (hill-climb) FFI ───────────────────────────────────────────
+
+/// Evolve a single FSM against a fixed opponent. JSON arguments:
+///   start_json: {"id":"<idstr>","s":<int>,"k":<int>}
+///   opp_json:   {"id":"<idstr>","s":<int>,"k":<int>}
+///   game:       payoff string (parse_game_dyn convention)
+///   rounds, steps, seed: integers
+/// Returns a JSON object {"trajectory":[{"id","s","k","fitness","accepted","candidate_fitness"},...]}.
+#[wll::export]
+pub fn fsm_evolve_single_wl(
+    start_json: String,
+    opp_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> String {
+    fsm_evolve_single_inner(start_json, opp_json, game, rounds, steps, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+#[derive(serde::Deserialize)]
+struct FsmIdSpec {
+    id: String,
+    s: usize,
+    k: usize,
+}
+
+fn fsm_evolve_single_inner(
+    start_json: String,
+    opp_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> Result<String, String> {
+    let start_spec: FsmIdSpec =
+        serde_json::from_str(&start_json).map_err(|e| format!("bad start: {}", e))?;
+    let opp_spec: FsmIdSpec =
+        serde_json::from_str(&opp_json).map_err(|e| format!("bad opp: {}", e))?;
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let start = evolve::decode_id_str(&start_spec.id, start_spec.s, start_spec.k)?;
+    let opp = evolve::decode_id_str(&opp_spec.id, opp_spec.s, opp_spec.k)?;
+    let traj = evolve::evolve_single(
+        &start,
+        &opp,
+        rounds.max(0) as u32,
+        steps.max(0) as usize,
+        &payoff,
+        seed as u64,
+    );
+    Ok(serde_json::json!({"trajectory": traj}).to_string())
+}
+
+#[wll::export]
+pub fn fsm_evolve_population_wl(
+    start_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> String {
+    fsm_evolve_population_inner(start_json, opps_json, game, rounds, steps, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+fn fsm_evolve_population_inner(
+    start_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> Result<String, String> {
+    let start_spec: FsmIdSpec =
+        serde_json::from_str(&start_json).map_err(|e| format!("bad start: {}", e))?;
+    let opp_specs: Vec<FsmIdSpec> =
+        serde_json::from_str(&opps_json).map_err(|e| format!("bad opps: {}", e))?;
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let start = evolve::decode_id_str(&start_spec.id, start_spec.s, start_spec.k)?;
+    let opps: Vec<_> = opp_specs
+        .iter()
+        .map(|sp| evolve::decode_id_str(&sp.id, sp.s, sp.k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let traj = evolve::evolve_population(
+        &start,
+        &opps,
+        rounds.max(0) as u32,
+        steps.max(0) as usize,
+        &payoff,
+        seed as u64,
+    );
+    Ok(serde_json::json!({"trajectory": traj}).to_string())
+}
+
+#[wll::export]
+pub fn fsm_evolve_coadapt_wl(
+    start_a_json: String,
+    start_b_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> String {
+    fsm_evolve_coadapt_inner(start_a_json, start_b_json, game, rounds, steps, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+fn fsm_evolve_coadapt_inner(
+    start_a_json: String,
+    start_b_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> Result<String, String> {
+    let a_spec: FsmIdSpec =
+        serde_json::from_str(&start_a_json).map_err(|e| format!("bad startA: {}", e))?;
+    let b_spec: FsmIdSpec =
+        serde_json::from_str(&start_b_json).map_err(|e| format!("bad startB: {}", e))?;
+    let payoff = tournament::parse_game_dyn(&game)?;
+    // Build the role-swapped payoff (so we can use the same kernel to
+    // get player-B's mean payoff by swapping arguments).
+    let mut swapped_entries = Vec::with_capacity(payoff.entries.len());
+    for ma in 0..payoff.num_actions {
+        for mb in 0..payoff.num_actions {
+            // Original P2 payoff for (ma vs mb) is entries[ma*na+mb][1].
+            // After swap (B is "A", A is "B"): query (mb vs ma) -> P1 of swapped
+            // should equal original P2 of (ma, mb). i.e. swapped[mb*na+ma][0] = orig[ma*na+mb][1].
+            // So swapped[i*na+j][0] = orig[j*na+i][1], swapped[i*na+j][1] = orig[j*na+i][0].
+            let orig = payoff.entries[mb * payoff.num_actions + ma];
+            swapped_entries.push([orig[1], orig[0]]);
+        }
+    }
+    let payoff_swapped = tournament::DynPayoff {
+        num_actions: payoff.num_actions,
+        entries: swapped_entries,
+    };
+    let a = evolve::decode_id_str(&a_spec.id, a_spec.s, a_spec.k)?;
+    let b = evolve::decode_id_str(&b_spec.id, b_spec.s, b_spec.k)?;
+    let traj = evolve::evolve_coadapt(
+        &a,
+        &b,
+        rounds.max(0) as u32,
+        steps.max(0) as usize,
+        &payoff,
+        &payoff_swapped,
+        seed as u64,
+    );
+    Ok(serde_json::json!({"trajectory": traj}).to_string())
+}
+
+/// Isolated FSM mutation FFI: applies a single mutation step to an FSM and
+/// returns the resulting {id, s, k}. Used for parity testing against
+/// Code-02.nb's MutateFSM/MutateFSMEdge/MutateFSMStateAction without the
+/// overhead of a full evolution loop.
+///
+/// kind: 0 = state-action only, 1 = edge only, 2 = combined MutateFSM.
+#[wll::export]
+pub fn fsm_mutate_wl(fsm_json: String, kind: i64, seed: i64) -> String {
+    fsm_mutate_inner(fsm_json, kind, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+fn fsm_mutate_inner(fsm_json: String, kind: i64, seed: i64) -> Result<String, String> {
+    let spec: FsmIdSpec =
+        serde_json::from_str(&fsm_json).map_err(|e| format!("bad fsm: {}", e))?;
+    let fsm = evolve::decode_id_str(&spec.id, spec.s, spec.k)?;
+    let mut rng = evolve::Rng::seed_from_u64(seed as u64);
+    let mutated = match kind {
+        0 => evolve::mutate_state_action(&fsm, &mut rng),
+        1 => evolve::mutate_edge(&fsm, &mut rng),
+        _ => evolve::mutate_fsm(&fsm, &mut rng),
+    };
+    let id = evolve::encode_fsm(&mutated)
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    Ok(serde_json::json!({
+        "id": id,
+        "s": mutated.states() as u64,
+        "k": mutated.actions as u64,
+    })
+    .to_string())
+}
+
+// ── New scoring / step / ensemble FFI exports ───────────────────────────────
+
+/// Mean payoff of one FSM vs one opponent over `rounds` rounds.
+#[wll::export]
+pub fn fsm_score_vs_one_wl(
+    fsm_json: String,
+    opp_json: String,
+    game: String,
+    rounds: i64,
+) -> f64 {
+    fsm_score_vs_one_inner(fsm_json, opp_json, game, rounds).unwrap_or(f64::NAN)
+}
+
+fn fsm_score_vs_one_inner(
+    fsm_json: String,
+    opp_json: String,
+    game: String,
+    rounds: i64,
+) -> Result<f64, String> {
+    let a_spec: FsmIdSpec =
+        serde_json::from_str(&fsm_json).map_err(|e| format!("bad fsm: {}", e))?;
+    let b_spec: FsmIdSpec =
+        serde_json::from_str(&opp_json).map_err(|e| format!("bad opp: {}", e))?;
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let a = evolve::decode_id_str(&a_spec.id, a_spec.s, a_spec.k)?;
+    let b = evolve::decode_id_str(&b_spec.id, b_spec.s, b_spec.k)?;
+    Ok(evolve::score_vs(&a, &b, rounds.max(0) as u32, &payoff))
+}
+
+/// Mean payoff of one FSM averaged over a list of opponents.
+#[wll::export]
+pub fn fsm_score_vs_many_wl(
+    fsm_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+) -> f64 {
+    fsm_score_vs_many_inner(fsm_json, opps_json, game, rounds).unwrap_or(f64::NAN)
+}
+
+fn fsm_score_vs_many_inner(
+    fsm_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+) -> Result<f64, String> {
+    let a_spec: FsmIdSpec =
+        serde_json::from_str(&fsm_json).map_err(|e| format!("bad fsm: {}", e))?;
+    let opp_specs: Vec<FsmIdSpec> =
+        serde_json::from_str(&opps_json).map_err(|e| format!("bad opps: {}", e))?;
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let a = evolve::decode_id_str(&a_spec.id, a_spec.s, a_spec.k)?;
+    let opps: Vec<_> = opp_specs
+        .iter()
+        .map(|sp| evolve::decode_id_str(&sp.id, sp.s, sp.k))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(evolve::score_vs_many(&a, &opps, rounds.max(0) as u32, &payoff))
+}
+
+/// One mutation step. Takes current FSM, current fitness, and an opponents list
+/// (length 1 = single opp). Returns JSON {fsm:{id,s,k}, fitness, accepted, candidate_fitness}.
+#[wll::export]
+pub fn fsm_evolve_step_wl(
+    cur_json: String,
+    cur_fit: f64,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    seed: i64,
+) -> String {
+    fsm_evolve_step_inner(cur_json, cur_fit, opps_json, game, rounds, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+fn fsm_evolve_step_inner(
+    cur_json: String,
+    cur_fit: f64,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    seed: i64,
+) -> Result<String, String> {
+    let cur_spec: FsmIdSpec =
+        serde_json::from_str(&cur_json).map_err(|e| format!("bad fsm: {}", e))?;
+    let opp_specs: Vec<FsmIdSpec> =
+        serde_json::from_str(&opps_json).map_err(|e| format!("bad opps: {}", e))?;
+    if opp_specs.is_empty() {
+        return Err("opponents list empty".into());
+    }
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let cur = evolve::decode_id_str(&cur_spec.id, cur_spec.s, cur_spec.k)?;
+    let opps: Vec<_> = opp_specs
+        .iter()
+        .map(|sp| evolve::decode_id_str(&sp.id, sp.s, sp.k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rng = evolve::Rng::seed_from_u64(seed as u64);
+    let (next, next_fit, accepted, cand_fit) =
+        evolve::evolve_step(&cur, cur_fit, &opps, rounds.max(0) as u32, &payoff, &mut rng);
+    let id = evolve::encode_fsm(&next)
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    Ok(serde_json::json!({
+        "id": id,
+        "s": next.states() as u64,
+        "k": next.actions as u64,
+        "fitness": next_fit,
+        "accepted": accepted,
+        "candidate_fitness": cand_fit,
+    })
+    .to_string())
+}
+
+/// n-step hill-climb against a list of opponents (length 1 = single).
+#[wll::export]
+pub fn fsm_evolve_trajectory_wl(
+    start_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> String {
+    fsm_evolve_trajectory_inner(start_json, opps_json, game, rounds, steps, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+fn fsm_evolve_trajectory_inner(
+    start_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> Result<String, String> {
+    let start_spec: FsmIdSpec =
+        serde_json::from_str(&start_json).map_err(|e| format!("bad start: {}", e))?;
+    let opp_specs: Vec<FsmIdSpec> =
+        serde_json::from_str(&opps_json).map_err(|e| format!("bad opps: {}", e))?;
+    if opp_specs.is_empty() {
+        return Err("opponents list empty".into());
+    }
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let start = evolve::decode_id_str(&start_spec.id, start_spec.s, start_spec.k)?;
+    let opps: Vec<_> = opp_specs
+        .iter()
+        .map(|sp| evolve::decode_id_str(&sp.id, sp.s, sp.k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let traj = evolve::evolve_trajectory(
+        &start,
+        &opps,
+        rounds.max(0) as u32,
+        steps.max(0) as usize,
+        &payoff,
+        seed as u64,
+    );
+    Ok(serde_json::json!({"trajectory": traj}).to_string())
+}
+
+/// Run N hill-climbs from a list of starting FSMs in parallel.
+/// Returns JSON {"trajectories":[[step,...], ...]}.
+#[wll::export]
+pub fn fsm_evolve_ensemble_wl(
+    starts_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> String {
+    fsm_evolve_ensemble_inner(starts_json, opps_json, game, rounds, steps, seed)
+        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e.replace('"', "'")))
+}
+
+fn fsm_evolve_ensemble_inner(
+    starts_json: String,
+    opps_json: String,
+    game: String,
+    rounds: i64,
+    steps: i64,
+    seed: i64,
+) -> Result<String, String> {
+    let start_specs: Vec<FsmIdSpec> =
+        serde_json::from_str(&starts_json).map_err(|e| format!("bad starts: {}", e))?;
+    let opp_specs: Vec<FsmIdSpec> =
+        serde_json::from_str(&opps_json).map_err(|e| format!("bad opps: {}", e))?;
+    if opp_specs.is_empty() {
+        return Err("opponents list empty".into());
+    }
+    let payoff = tournament::parse_game_dyn(&game)?;
+    let starts: Vec<_> = start_specs
+        .iter()
+        .map(|sp| evolve::decode_id_str(&sp.id, sp.s, sp.k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let opps: Vec<_> = opp_specs
+        .iter()
+        .map(|sp| evolve::decode_id_str(&sp.id, sp.s, sp.k))
+        .collect::<Result<Vec<_>, _>>()?;
+    let trajs = evolve::evolve_ensemble(
+        &starts,
+        &opps,
+        rounds.max(0) as u32,
+        steps.max(0) as usize,
+        &payoff,
+        seed as u64,
+    );
+    Ok(serde_json::json!({"trajectories": trajs}).to_string())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

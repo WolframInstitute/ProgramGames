@@ -57,7 +57,17 @@ PacletObject[
           "WolframInstitute`ProgramGames`ProgramIteratedGameCross",
           "WolframInstitute`ProgramGames`IteratedGameFiniteStateMachine",
           "WolframInstitute`ProgramGames`IteratedGameCellularAutomaton",
-          "WolframInstitute`ProgramGames`IteratedGameTuringMachine"
+          "WolframInstitute`ProgramGames`IteratedGameTuringMachine",
+          "WolframInstitute`ProgramGames`FSMEvolveVsOne",
+          "WolframInstitute`ProgramGames`FSMEvolveVsMany",
+          "WolframInstitute`ProgramGames`FSMEvolveCoadapt",
+          "WolframInstitute`ProgramGames`FSMEvolveEnsemble",
+          "WolframInstitute`ProgramGames`FSMEvolveStepRust",
+          "WolframInstitute`ProgramGames`FSMEvolveTrajectoryRust",
+          "WolframInstitute`ProgramGames`FSMScoreVsOne",
+          "WolframInstitute`ProgramGames`FSMScoreVsMany",
+          "WolframInstitute`ProgramGames`FSMEvolveSingle",
+          "WolframInstitute`ProgramGames`FSMEvolvePopulation"
         }
       },
       {
