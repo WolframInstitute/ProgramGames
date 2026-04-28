@@ -225,17 +225,41 @@ FSMEvolveCoadapt[startA : {_, _Integer, _Integer}, startB : {_, _Integer, _Integ
 				{ToExpression[#["id_a"]], #["s_a"], #["k_a"]},
 				{ToExpression[#["id_b"]], #["s_b"], #["k_b"]},
 				#["score_a"],
-				#["score_b"]
+				#["score_b"],
+				Replace[#["mutator"], {Null -> None, m_String :> m}],
+				#["cand_score_a"],
+				#["cand_score_b"],
+				TrueQ[#["accepted"]]
 			} &,
 			traj
 		];
-		<|
-			"Trajectory" -> history,
-			"ScoreCurveA" -> history[[All, 3]],
-			"ScoreCurveB" -> history[[All, 4]],
-			"StartA" -> startA,
-			"StartB" -> startB
-		|>
+		Module[{rejA, rejB, attemptsA, attemptsB, acceptsA, acceptsB, rateA, rateB},
+			rejA = Cases[
+				MapIndexed[{#2[[1]] - 1, #1} &, history],
+				{step_, {_, _, _, _, "A", csa_, _, False}} :> {step, csa}
+			];
+			rejB = Cases[
+				MapIndexed[{#2[[1]] - 1, #1} &, history],
+				{step_, {_, _, _, _, "B", _, csb_, False}} :> {step, csb}
+			];
+			attemptsA = Count[history[[All, 5]], "A"];
+			attemptsB = Count[history[[All, 5]], "B"];
+			acceptsA = Count[history, {_, _, _, _, "A", _, _, True}];
+			acceptsB = Count[history, {_, _, _, _, "B", _, _, True}];
+			rateA = If[attemptsA > 0, N[acceptsA / attemptsA], Indeterminate];
+			rateB = If[attemptsB > 0, N[acceptsB / attemptsB], Indeterminate];
+			<|
+				"Trajectory" -> history,
+				"ScoreCurveA" -> history[[All, 3]],
+				"ScoreCurveB" -> history[[All, 4]],
+				"RejectedA" -> rejA,
+				"RejectedB" -> rejB,
+				"AcceptanceRateA" -> rateA,
+				"AcceptanceRateB" -> rateB,
+				"StartA" -> startA,
+				"StartB" -> startB
+			|>
+		]
 	];
 
 

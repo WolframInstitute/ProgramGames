@@ -398,6 +398,13 @@ pub struct CoadaptEntry {
     pub k_b: u64,
     pub score_a: f64,
     pub score_b: f64,
+    /// "A", "B", or null for the seed row.
+    pub mutator: Option<String>,
+    /// Score of the candidate (against unchanged opposing side) for player A.
+    pub cand_score_a: f64,
+    /// Score of the candidate (against unchanged opposing side) for player B.
+    pub cand_score_b: f64,
+    pub accepted: bool,
 }
 
 fn fsm_to_id_string(fsm: &RawFsm) -> String {
@@ -512,28 +519,45 @@ pub fn evolve_coadapt(
         k_b: b.actions as u64,
         score_a: p1,
         score_b: p2,
+        mutator: None,
+        cand_score_a: p1,
+        cand_score_b: p2,
+        accepted: true,
     });
 
     for step in 1..=steps {
+        let (mutator, cand_sa, cand_sb, accepted);
         if step % 2 == 1 {
             // mutate A
             let cand = mutate_fsm(&a, &mut rng);
             let sa = score_vs(&cand, &b, rounds, payoff);
             let sb = score_vs(&b, &cand, rounds, payoff_swapped);
+            mutator = "A";
+            cand_sa = sa;
+            cand_sb = sb;
             if sa >= p1 {
                 a = cand;
                 p1 = sa;
                 p2 = sb;
+                accepted = true;
+            } else {
+                accepted = false;
             }
         } else {
             // mutate B
             let cand = mutate_fsm(&b, &mut rng);
             let sa = score_vs(&a, &cand, rounds, payoff);
             let sb = score_vs(&cand, &a, rounds, payoff_swapped);
+            mutator = "B";
+            cand_sa = sa;
+            cand_sb = sb;
             if sb >= p2 {
                 b = cand;
                 p1 = sa;
                 p2 = sb;
+                accepted = true;
+            } else {
+                accepted = false;
             }
         }
         hist.push(CoadaptEntry {
@@ -545,6 +569,10 @@ pub fn evolve_coadapt(
             k_b: b.actions as u64,
             score_a: p1,
             score_b: p2,
+            mutator: Some(mutator.to_string()),
+            cand_score_a: cand_sa,
+            cand_score_b: cand_sb,
+            accepted,
         });
     }
     hist
